@@ -1,0 +1,12 @@
+{
+  "id": "custom-005-write-readme",
+  "suite": "custom",
+  "workspace": { "fixture": "fixture" },
+  "prompt": "阅读 TaskQueue.java，在工作区根目录生成一份 README.md：包含这个类的用途简介和一个 Java 使用示例代码块（用 ``` 围栏）。不要修改 TaskQueue.java。",
+  "timeout_seconds": 300,
+  "graders": [
+    { "type": "file_assert", "name": "readme_exists", "path": "README.md", "regex": "(?s)TaskQueue" },
+    { "type": "file_assert", "name": "readme_has_example", "path": "README.md", "contains": "```" },
+    { "type": "file_assert", "name": "source_untouched", "path": "TaskQueue.java", "contains": "task must not be blank" }
+  ]
+}

@@ -217,6 +217,22 @@ v16.1 抽出 `Renderer` 接口 + 三个实现：
 - reasoning、图片 base64 和常见凭据不会写入 Trace，单属性最大 16 KiB
 - 当前边界：尚未覆盖 Plan / Team / 独立 SubAgent；10 条 Dataset 与 `tests_pass` / `task_success` / `token_count` 验收流程见 `docs/langfuse-mvp-observability.md`
 
+### 评测体系 Phase E1（Eval Harness MVP + custom suite）
+
+- 独立入口 `com.paicli.eval.EvalMain`（不进入 CLI 运行时路径），黑盒驱动 `serve --http` 子进程跑评测：
+
+```bash
+mvn clean package
+java -cp target/paicli-1.0-SNAPSHOT.jar com.paicli.eval.EvalMain --suite custom
+```
+
+- 每条 case 独立一次性工作区（fixture 复制 + JGit baseline），通过 Runtime API 提交任务并轮询到终态
+- E1 内置三类 grader：`command`（验收命令按退出码打分）、`output_assert`（回答断言）、`file_assert`（文件断言）；`task_success` = turn 正常结束且全部 BOOLEAN 分通过
+- 输出 `eval/runs/<run-id>/`：`report.json` / `report.md` + 每 case 的 `artifact.json` / `workspace.diff` / `transcript.txt`；被测进程日志与 runtime db 隔离在本次运行目录
+- 用例在 `eval/suites/custom/`（10 条：修 bug / 实现函数 / 文件编辑 / 文档生成 / 纯问答），验收只依赖 `javac` / `java`
+- 常用参数：`--case <id>` 单条运行、`--keep-workspace` 保留现场、`--timeout <s>` 全局超时；`.env` 的 API Key 由 harness 注入子进程
+- 当前边界：仅 host 沙盒（`sandbox: docker` 的 case 会被跳过）；工件聚合 / 工具指标 / 安全评测 / swe+terminal suite 见 `docs/evaluation-system-design.md`（Phase E2–E5）
+
 ### 第六期 HITL 增强（路径围栏 / 命令快速拒绝 / 操作审计）
 
 `com.paicli.policy` 包，作为 HITL 之外的辅助层（不是沙箱、不提供进程隔离）：

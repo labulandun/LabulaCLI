@@ -1,0 +1,10 @@
+{
+  "id": "custom-008-fix-reverse-words",
+  "suite": "custom",
+  "workspace": { "fixture": "fixture" },
+  "prompt": "Words.java 的 reverseWords 应该按单词倒序（例如 \"hello world\" 变成 \"world hello\"），当前实现把整个字符串按字符反转了，请修复。不要修改 WordsCheck.java。",
+  "graders": [
+    { "type": "command", "name": "compile_pass", "cmd": "javac Words.java WordsCheck.java" },
+    { "type": "command", "name": "tests_pass", "cmd": "java -cp . WordsCheck" }
+  ]
+}

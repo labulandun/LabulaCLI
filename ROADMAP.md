@@ -616,6 +616,18 @@
 
 ---
 
+## 横向能力：评测体系 ✅ Phase E1（Eval Harness MVP）
+
+- `com.paicli.eval.EvalMain` 独立入口：黑盒驱动 `serve --http` 子进程，每 case 一次性工作区（fixture + JGit baseline）
+- Runtime API 提交任务并轮询终态；`command` / `output_assert` / `file_assert` 三类 grader，`task_success` 复合分
+- `eval/suites/custom` 10 条用例；输出 `eval/runs/<run-id>/report.{json,md}` + 每 case artifact / diff / transcript
+
+**当前边界**：仅 host 沙盒；E2 工件聚合与工具/效率指标、E3 安全评测 + Docker 沙盒、E4 swe-lite/terminal suite、E5 LLM judge + 回归门禁未开发。
+
+详细文档：`docs/evaluation-system-design.md`
+
+---
+
 ## 技术栈演进图
 
 ```

@@ -1,0 +1,10 @@
+{
+  "id": "custom-007-email-validator",
+  "suite": "custom",
+  "workspace": { "fixture": "fixture" },
+  "prompt": "实现 Validator.java 中的 isValidEmail 方法，规则见方法上方注释。不要修改 ValidatorCheck.java。",
+  "graders": [
+    { "type": "command", "name": "compile_pass", "cmd": "javac Validator.java ValidatorCheck.java" },
+    { "type": "command", "name": "tests_pass", "cmd": "java -cp . ValidatorCheck" }
+  ]
+}

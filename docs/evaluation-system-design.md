@@ -1,6 +1,7 @@
 # PaiCLI 评测体系设计（Eval System Design）
 
-> 状态：设计稿，未开发。本文是评测体系的总设计 + 分阶段开发计划（Phase E1–E5）。
+> 状态：Phase E1 已交付（harness MVP + custom suite 10 条，入口 `com.paicli.eval.EvalMain`）；E2–E5 未开发。
+> 本文是评测体系的总设计 + 分阶段开发计划（Phase E1–E5）。
 > 前置依赖：`docs/langfuse-mvp-observability.md` 中已交付的 OpenTelemetry/Langfuse 埋点。
 
 ---

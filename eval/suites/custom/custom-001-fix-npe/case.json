@@ -1,0 +1,11 @@
+{
+  "id": "custom-001-fix-npe",
+  "suite": "custom",
+  "workspace": { "fixture": "fixture" },
+  "prompt": "修复 StringUtils.java 中 capitalize 方法的缺陷：传入 null 或空字符串时应返回空字符串，而不是抛异常；其余输入行为保持不变。不要修改 StringUtilsCheck.java。",
+  "graders": [
+    { "type": "command", "name": "compile_pass", "cmd": "javac StringUtils.java StringUtilsCheck.java" },
+    { "type": "command", "name": "tests_pass", "cmd": "java -cp . StringUtilsCheck" },
+    { "type": "file_assert", "name": "check_untouched", "path": "StringUtilsCheck.java", "contains": "ALL CHECKS PASSED" }
+  ]
+}

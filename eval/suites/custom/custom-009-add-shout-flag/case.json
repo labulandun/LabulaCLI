@@ -1,0 +1,11 @@
+{
+  "id": "custom-009-add-shout-flag",
+  "suite": "custom",
+  "workspace": { "fixture": "fixture" },
+  "prompt": "给 GreetApp.java 增加 shout 功能：render(name, shout) 在 shout 为 true 时返回全大写的问候语，false 时行为不变；main 方法支持 --shout 参数走大写分支。不要修改 GreetAppCheck.java。",
+  "graders": [
+    { "type": "command", "name": "compile_pass", "cmd": "javac GreetApp.java GreetAppCheck.java" },
+    { "type": "command", "name": "tests_pass", "cmd": "java -cp . GreetAppCheck" },
+    { "type": "file_assert", "name": "main_wired", "path": "GreetApp.java", "contains": "--shout" }
+  ]
+}
