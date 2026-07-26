@@ -1,0 +1,11 @@
+{
+  "id": "tg-001-locate-class",
+  "suite": "tool-golden",
+  "workspace": { "fixture": "../_shared/mini-shop" },
+  "prompt": "OrderService 类定义在哪个文件？给出相对路径，不要修改任何文件。",
+  "timeout_seconds": 300,
+  "graders": [
+    { "type": "tool_selection", "expected": ["grep_code", "glob_files"] },
+    { "type": "output_assert", "name": "path_answered", "regex": "OrderService\\.java" }
+  ]
+}

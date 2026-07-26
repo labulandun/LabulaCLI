@@ -4,9 +4,12 @@ import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.api.trace.Tracer;
 import io.opentelemetry.sdk.OpenTelemetrySdk;
 import io.opentelemetry.sdk.autoconfigure.AutoConfiguredOpenTelemetrySdk;
+import io.opentelemetry.sdk.trace.SdkTracerProvider;
+import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -73,6 +76,9 @@ public final class OpenTelemetryBootstrap implements AutoCloseable {
         if (!isEnabled(lookup)) {
             return new OpenTelemetryBootstrap(false, OpenTelemetry.noop(), null);
         }
+        if ("file".equalsIgnoreCase(trimmed(lookup.apply("PAICLI_OTEL_TRACES_EXPORTER")))) {
+            return initializeFileExporter(lookup);
+        }
 
         Map<String, String> properties = new LinkedHashMap<>();
         OTEL_PROPERTY_NAMES.forEach((environmentName, propertyName) -> {
@@ -95,6 +101,29 @@ public final class OpenTelemetryBootstrap implements AutoCloseable {
                 properties.getOrDefault("otel.service.name", "paicli"),
                 properties.getOrDefault("otel.traces.exporter", "otlp"));
         return new OpenTelemetryBootstrap(true, sdk, sdk);
+    }
+
+    /**
+     * 评测 harness 模式：span 逐条同步落盘为 JSONL，不经过 OTLP。
+     * 配置：PAICLI_OTEL_TRACES_EXPORTER=file + PAICLI_OTEL_TRACES_FILE=<path>。
+     */
+    private static OpenTelemetryBootstrap initializeFileExporter(Function<String, String> lookup) {
+        String file = trimmed(lookup.apply("PAICLI_OTEL_TRACES_FILE"));
+        if (file == null) {
+            log.warn("PAICLI_OTEL_TRACES_EXPORTER=file 但未配置 PAICLI_OTEL_TRACES_FILE，禁用 OpenTelemetry");
+            return new OpenTelemetryBootstrap(false, OpenTelemetry.noop(), null);
+        }
+        try {
+            SdkTracerProvider tracerProvider = SdkTracerProvider.builder()
+                    .addSpanProcessor(SimpleSpanProcessor.create(FileSpanExporter.create(Path.of(file))))
+                    .build();
+            OpenTelemetrySdk sdk = OpenTelemetrySdk.builder().setTracerProvider(tracerProvider).build();
+            log.info("OpenTelemetry enabled: traceExporter=file, file={}", file);
+            return new OpenTelemetryBootstrap(true, sdk, sdk);
+        } catch (Exception e) {
+            log.warn("file span exporter 初始化失败，禁用 OpenTelemetry: {}", file, e);
+            return new OpenTelemetryBootstrap(false, OpenTelemetry.noop(), null);
+        }
     }
 
     public boolean enabled() {
@@ -138,7 +167,9 @@ public final class OpenTelemetryBootstrap implements AutoCloseable {
             return false;
         }
         return trimmed(lookup.apply("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")) != null
-                || trimmed(lookup.apply("OTEL_EXPORTER_OTLP_ENDPOINT")) != null;
+                || trimmed(lookup.apply("OTEL_EXPORTER_OTLP_ENDPOINT")) != null
+                || ("file".equalsIgnoreCase(trimmed(lookup.apply("PAICLI_OTEL_TRACES_EXPORTER")))
+                        && trimmed(lookup.apply("PAICLI_OTEL_TRACES_FILE")) != null);
     }
 
     private static String trimmed(String value) {

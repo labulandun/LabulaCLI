@@ -616,13 +616,14 @@
 
 ---
 
-## 横向能力：评测体系 ✅ Phase E1（Eval Harness MVP）
+## 横向能力：评测体系 ✅ Phase E1 + E2（Harness MVP + 工件聚合/工具指标）
 
 - `com.paicli.eval.EvalMain` 独立入口：黑盒驱动 `serve --http` 子进程，每 case 一次性工作区（fixture + JGit baseline）
-- Runtime API 提交任务并轮询终态；`command` / `output_assert` / `file_assert` 三类 grader，`task_success` 复合分
-- `eval/suites/custom` 10 条用例；输出 `eval/runs/<run-id>/report.{json,md}` + 每 case artifact / diff / transcript
+- Runtime API 提交任务并轮询终态；`command` / `output_assert` / `file_assert` / `tool_selection` 四类 grader，`task_success` 复合分
+- `eval/suites/custom` 10 条 + `eval/suites/tool-golden` 5 条；输出 `eval/runs/<run-id>/report.{json,md}` + 每 case artifact / diff / transcript / spans.jsonl
+- E2：`PAICLI_OTEL_TRACES_EXPORTER=file` 同步落盘 span；artifact 聚合 llm token 三段口径与 tool 明细，自动产出 `tokens_total` / `llm_rounds` / `tool_calls` / `tool_error_rate` 指标分
 
-**当前边界**：仅 host 沙盒；E2 工件聚合与工具/效率指标、E3 安全评测 + Docker 沙盒、E4 swe-lite/terminal suite、E5 LLM judge + 回归门禁未开发。
+**当前边界**：仅 host 沙盒；E3 安全评测 + Docker 沙盒、E4 swe-lite/terminal suite、E5 LLM judge + 回归门禁未开发。
 
 详细文档：`docs/evaluation-system-design.md`
 

@@ -11,8 +11,10 @@ public final class GraderFactory {
             case "command" -> new CommandGrader(spec);
             case "output_assert" -> new OutputAssertGrader(spec);
             case "file_assert" -> new FileAssertGrader(spec);
+            case "tool_selection" -> new ToolSelectionGrader(spec);
             default -> throw new IllegalArgumentException(
-                    "未知 grader type: " + spec.type() + "（E1 支持 command / output_assert / file_assert）");
+                    "未知 grader type: " + spec.type()
+                            + "（支持 command / output_assert / file_assert / tool_selection）");
         };
     }
 }

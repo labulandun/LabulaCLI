@@ -231,7 +231,16 @@ java -cp target/paicli-1.0-SNAPSHOT.jar com.paicli.eval.EvalMain --suite custom
 - 输出 `eval/runs/<run-id>/`：`report.json` / `report.md` + 每 case 的 `artifact.json` / `workspace.diff` / `transcript.txt`；被测进程日志与 runtime db 隔离在本次运行目录
 - 用例在 `eval/suites/custom/`（10 条：修 bug / 实现函数 / 文件编辑 / 文档生成 / 纯问答），验收只依赖 `javac` / `java`
 - 常用参数：`--case <id>` 单条运行、`--keep-workspace` 保留现场、`--timeout <s>` 全局超时；`.env` 的 API Key 由 harness 注入子进程
-- 当前边界：仅 host 沙盒（`sandbox: docker` 的 case 会被跳过）；工件聚合 / 工具指标 / 安全评测 / swe+terminal suite 见 `docs/evaluation-system-design.md`（Phase E2–E5）
+
+### 评测体系 Phase E2（spans 落盘 + 工件聚合 + 工具/效率指标）
+
+- `PAICLI_OTEL_TRACES_EXPORTER=file` + `PAICLI_OTEL_TRACES_FILE=<path>`：span 用 SimpleSpanProcessor 同步逐条落盘为 JSONL（子进程被强杀也不丢 span），评测流量不进 Langfuse；harness 自动给子进程注入
+- 每 case 工件新增 `spans.jsonl`，`artifact.json` 聚合出 `llm`（rounds / input / cached / output / total token，口径与 Langfuse usage_details 一致）与 `tools[]`（名称 / OK-ERROR-WARNING / 耗时）
+- 每条执行过的 case 自动附带 NUMERIC 指标分：`tokens_total` / `llm_rounds` / `tool_calls` / `tool_errors` / `tool_error_rate`（不参与 task_success）；report 汇总里有 run 级 token 总量与 tool_error_rate
+- 新 grader `tool_selection`：断言工具选择（`first_search` 首个检索类工具 / `first` / `any` 三种模式），数据来自 tool span 序列
+- 新 suite `eval/suites/tool-golden/`（5 条，共享 mini-shop fixture）：验证"该用 `grep_code`/`glob_files` 时是否用了"，与 `docs/code-search-golden-set.md` 的确定性 golden set 互补（那边测工具实现，这边测模型的工具选择）
+- 运行：`java -cp target/paicli-1.0-SNAPSHOT.jar com.paicli.eval.EvalMain --suite custom,tool-golden`
+- 当前边界：仅 host 沙盒（`sandbox: docker` 的 case 会被跳过）；安全评测 / swe+terminal suite / LLM judge 见 `docs/evaluation-system-design.md`（Phase E3–E5）
 
 ### 第六期 HITL 增强（路径围栏 / 命令快速拒绝 / 操作审计）
 

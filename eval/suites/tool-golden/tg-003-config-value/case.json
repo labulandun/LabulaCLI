@@ -1,0 +1,11 @@
+{
+  "id": "tg-003-config-value",
+  "suite": "tool-golden",
+  "workspace": { "fixture": "../_shared/mini-shop" },
+  "prompt": "这个项目配置的 server.port 是多少？不要修改任何文件。",
+  "timeout_seconds": 300,
+  "graders": [
+    { "type": "tool_selection", "expected": ["grep_code", "glob_files"] },
+    { "type": "output_assert", "name": "port_answered", "regex": "8080" }
+  ]
+}

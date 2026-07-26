@@ -110,8 +110,9 @@ public final class EvalMain {
             workspace = Workspace.provision(spec, caseRunDir.resolve("workspace"));
             int port = PaiCliProcess.freePort();
             String apiKey = "eval-" + UUID.randomUUID();
+            Path spansFile = caseRunDir.resolve("spans.jsonl");
             process = PaiCliProcess.start(jar, workspace.root(), caseRunDir.resolve("runtime"),
-                    caseRunDir.resolve("paicli.log"), port, apiKey, dotEnv);
+                    caseRunDir.resolve("paicli.log"), spansFile, port, apiKey, dotEnv);
 
             RuntimeApiClient client = new RuntimeApiClient(port, apiKey);
             String threadId = client.createThread();
@@ -123,9 +124,12 @@ public final class EvalMain {
             long wallTimeMs = (System.nanoTime() - startNanos) / 1_000_000;
 
             Workspace.DiffStats diff = workspace.diff();
+            List<SpanLog.SpanRecord> spans = SpanLog.read(spansFile);
+            String traceId = outcome.traceId() != null ? outcome.traceId() : SpanArtifacts.rootTraceId(spans);
             RunArtifact artifact = new RunArtifact(spec.id(), runIndex, outcome.status(),
-                    outcome.finalAnswer(), outcome.error(), outcome.traceId(), outcome.rootObservationId(),
-                    wallTimeMs, diff.filesChanged(), diff.insertions(), diff.deletions());
+                    outcome.finalAnswer(), outcome.error(), traceId, outcome.rootObservationId(),
+                    wallTimeMs, diff.filesChanged(), diff.insertions(), diff.deletions(),
+                    SpanArtifacts.llmStats(spans), SpanArtifacts.toolStats(spans));
 
             Files.writeString(caseRunDir.resolve("transcript.txt"),
                     "prompt:\n" + spec.prompt() + "\n\nstatus: " + outcome.status()
@@ -135,13 +139,15 @@ public final class EvalMain {
             Files.writeString(caseRunDir.resolve("workspace.diff"), diff.patch(), StandardCharsets.UTF_8);
 
             List<Score> scores = gradeAll(spec, artifact, workspace.root());
+            scores.addAll(SpanArtifacts.metricScores(artifact));
             CaseResult result = CaseResult.of(spec, runIndex, artifact, scores);
             writeArtifactJson(caseRunDir.resolve("artifact.json"), result);
             return result;
         } catch (Exception e) {
             long wallTimeMs = (System.nanoTime() - startNanos) / 1_000_000;
             RunArtifact artifact = new RunArtifact(spec.id(), runIndex, "error", "",
-                    describe(e), null, null, wallTimeMs, 0, 0, 0);
+                    describe(e), null, null, wallTimeMs, 0, 0, 0,
+                    RunArtifact.LlmStats.EMPTY, List.of());
             CaseResult result = new CaseResult(spec.id(), spec.suite(), runIndex, artifact,
                     List.of(), false, null);
             try {

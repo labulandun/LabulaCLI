@@ -43,6 +43,13 @@ public final class Reporter {
         summary.put("pass_rate", executed.isEmpty() ? 0.0 : round4((double) passed / executed.size()));
         summary.put("avg_wall_time_ms", executed.isEmpty() ? 0
                 : (long) executed.stream().mapToLong(r -> r.artifact().wallTimeMs()).average().orElse(0));
+        summary.put("tokens_total", executed.stream()
+                .mapToLong(r -> r.artifact().llm().totalTokens()).sum());
+        long toolCalls = executed.stream().mapToLong(r -> r.artifact().tools().size()).sum();
+        long toolErrors = executed.stream().mapToLong(r -> r.artifact().toolErrors()).sum();
+        summary.put("tool_calls", toolCalls);
+        summary.put("tool_errors", toolErrors);
+        summary.put("tool_error_rate", toolCalls == 0 ? 0.0 : round4((double) toolErrors / toolCalls));
 
         ObjectNode suites = summary.putObject("suites");
         for (Map.Entry<String, List<CaseResult>> entry : groupBySuite(executed).entrySet()) {
@@ -65,6 +72,10 @@ public final class Reporter {
             node.put("files_changed", result.artifact().filesChanged());
             node.put("insertions", result.artifact().insertions());
             node.put("deletions", result.artifact().deletions());
+            node.put("llm_rounds", result.artifact().llm().rounds());
+            node.put("tokens_total", result.artifact().llm().totalTokens());
+            node.put("tool_calls", result.artifact().tools().size());
+            node.put("tool_errors", result.artifact().toolErrors());
             if (result.artifact().traceId() != null) {
                 node.put("trace_id", result.artifact().traceId());
             }
@@ -95,14 +106,18 @@ public final class Reporter {
             md.append(String.format("（另有 %d 条 skipped）", results.size() - executed.size()));
         }
         md.append("\n\n");
-        md.append("| case | status | task_success | wall_time | files± | scores |\n");
-        md.append("|------|--------|--------------|-----------|--------|--------|\n");
+        md.append("| case | status | task_success | wall_time | tokens | rounds | tools | files± | scores |\n");
+        md.append("|------|--------|--------------|-----------|--------|--------|-------|--------|--------|\n");
         for (CaseResult result : results) {
-            md.append(String.format("| %s | %s | %s | %.1fs | %d(+%d/-%d) | %s |\n",
+            md.append(String.format("| %s | %s | %s | %.1fs | %d | %d | %d(%dE) | %d(+%d/-%d) | %s |\n",
                     result.caseId(),
                     result.artifact().status(),
                     result.executed() ? (result.taskSuccess() ? "✅" : "❌") : "⏭",
                     result.artifact().wallTimeMs() / 1000.0,
+                    result.artifact().llm().totalTokens(),
+                    result.artifact().llm().rounds(),
+                    result.artifact().tools().size(),
+                    result.artifact().toolErrors(),
                     result.artifact().filesChanged(),
                     result.artifact().insertions(),
                     result.artifact().deletions(),
@@ -127,23 +142,19 @@ public final class Reporter {
         return md.toString();
     }
 
+    /** md 表格只列 BOOLEAN 断言分；NUMERIC 指标已有独立列（report.json 里两者都全）。 */
     private static String scoreSummary(CaseResult result) {
-        if (result.scores().isEmpty()) {
-            return "-";
-        }
         StringBuilder sb = new StringBuilder();
         for (Score score : result.scores()) {
+            if (score.dataType() != Score.DataType.BOOLEAN) {
+                continue;
+            }
             if (sb.length() > 0) {
                 sb.append(", ");
             }
-            sb.append(score.name()).append('=');
-            if (score.dataType() == Score.DataType.BOOLEAN) {
-                sb.append(score.passed() ? "1" : "0");
-            } else {
-                sb.append(score.value());
-            }
+            sb.append(score.name()).append('=').append(score.passed() ? "1" : "0");
         }
-        return sb.toString();
+        return sb.length() == 0 ? "-" : sb.toString();
     }
 
     private static Map<String, List<CaseResult>> groupBySuite(List<CaseResult> executed) {

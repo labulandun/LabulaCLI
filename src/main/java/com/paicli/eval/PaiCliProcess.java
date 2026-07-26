@@ -37,6 +37,7 @@ public final class PaiCliProcess implements AutoCloseable {
                                       Path workspace,
                                       Path runtimeDir,
                                       Path logFile,
+                                      Path spansFile,
                                       int port,
                                       String apiKey,
                                       Map<String, String> dotEnv) throws IOException {
@@ -54,6 +55,11 @@ public final class PaiCliProcess implements AutoCloseable {
         }
         builder.environment().put("PAICLI_RUNTIME_API_KEY", apiKey);
         builder.environment().put("PAICLI_RUNTIME_DIR", runtimeDir.toAbsolutePath().toString());
+        // 评测强制 file exporter（覆盖 .env 的 OTLP 配置）：span 同步落盘供工件聚合，
+        // 评测流量不进 Langfuse
+        builder.environment().put("PAICLI_OTEL_ENABLED", "true");
+        builder.environment().put("PAICLI_OTEL_TRACES_EXPORTER", "file");
+        builder.environment().put("PAICLI_OTEL_TRACES_FILE", spansFile.toAbsolutePath().toString());
         builder.redirectErrorStream(true);
         builder.redirectOutput(ProcessBuilder.Redirect.appendTo(logFile.toFile()));
         Process process = builder.start();

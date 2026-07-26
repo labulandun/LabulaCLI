@@ -32,7 +32,8 @@ class GraderTest {
     }
 
     private static RunArtifact artifact(String answer) {
-        return new RunArtifact("case-x", 1, "completed", answer, null, null, null, 1000, 0, 0, 0);
+        return new RunArtifact("case-x", 1, "completed", answer, null, null, null, 1000, 0, 0, 0,
+                RunArtifact.LlmStats.EMPTY, List.of());
     }
 
     private CaseSpec caseSpec() {

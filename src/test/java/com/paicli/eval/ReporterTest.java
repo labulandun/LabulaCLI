@@ -20,14 +20,17 @@ class ReporterTest {
 
     private static CaseResult passed(String id) {
         RunArtifact artifact = new RunArtifact(id, 1, "completed", "ok", null, "trace-1", "obs-1",
-                4000, 1, 5, 2);
+                4000, 1, 5, 2,
+                new RunArtifact.LlmStats(3, 900, 100, 200, 1200),
+                List.of(new RunArtifact.ToolCallStat("grep_code", "OK", 100),
+                        new RunArtifact.ToolCallStat("execute_command", "ERROR", 300)));
         return CaseResult.of(spec(id), 1, artifact,
                 List.of(Score.bool("tests_pass", true, "ok")));
     }
 
     private static CaseResult failed(String id) {
         RunArtifact artifact = new RunArtifact(id, 1, "completed", "no", null, null, null,
-                8000, 0, 0, 0);
+                8000, 0, 0, 0, RunArtifact.LlmStats.EMPTY, List.of());
         return CaseResult.of(spec(id), 1, artifact,
                 List.of(Score.bool("tests_pass", false, "exit=1 cmd=java Check\nFAIL detail")));
     }
@@ -47,15 +50,23 @@ class ReporterTest {
         assertEquals(0.5, report.path("summary").path("suites").path("custom").path("pass_rate").asDouble());
         assertEquals("trace-1", report.path("cases").get(0).path("trace_id").asText());
         assertTrue(report.path("cases").get(2).path("skip_reason").asText().contains("docker"));
+        assertEquals(1200, report.path("summary").path("tokens_total").asLong());
+        assertEquals(2, report.path("summary").path("tool_calls").asInt());
+        assertEquals(0.5, report.path("summary").path("tool_error_rate").asDouble());
+        assertEquals(1200, report.path("cases").get(0).path("tokens_total").asLong());
+        assertEquals(3, report.path("cases").get(0).path("llm_rounds").asInt());
+        assertEquals(1, report.path("cases").get(0).path("tool_errors").asLong());
     }
 
     @Test
     void turnFailureOrEmptyScoresNeverCountAsSuccess() {
-        RunArtifact failedTurn = new RunArtifact("c1", 1, "failed", "", "boom", null, null, 100, 0, 0, 0);
+        RunArtifact failedTurn = new RunArtifact("c1", 1, "failed", "", "boom", null, null, 100, 0, 0, 0,
+                RunArtifact.LlmStats.EMPTY, List.of());
         assertFalse(CaseResult.of(spec("c1"), 1, failedTurn,
                 List.of(Score.bool("tests_pass", true, "ok"))).taskSuccess());
 
-        RunArtifact completed = new RunArtifact("c2", 1, "completed", "ok", null, null, null, 100, 0, 0, 0);
+        RunArtifact completed = new RunArtifact("c2", 1, "completed", "ok", null, null, null, 100, 0, 0, 0,
+                RunArtifact.LlmStats.EMPTY, List.of());
         assertFalse(CaseResult.of(spec("c2"), 1, completed, List.of()).taskSuccess());
     }
 
