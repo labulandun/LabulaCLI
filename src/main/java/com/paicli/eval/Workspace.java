@@ -20,6 +20,7 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.Comparator;
 import java.util.List;
+import java.util.function.Predicate;
 import java.util.stream.Stream;
 
 /**
@@ -42,11 +43,47 @@ public final class Workspace implements AutoCloseable {
 
     public static Workspace provision(CaseSpec spec, Path workspaceDir) throws Exception {
         Files.createDirectories(workspaceDir);
+        if (spec.gitSource() != null) {
+            return provisionFromGit(spec.gitSource(), workspaceDir);
+        }
         if (spec.fixtureDir() != null) {
             copyRecursively(spec.fixtureDir(), workspaceDir);
         }
         Git git = Git.init().setDirectory(workspaceDir.toFile()).setInitialBranch("main").call();
         git.add().addFilepattern(".").call();
+        commitBaseline(git);
+        return new Workspace(workspaceDir, git);
+    }
+
+    /**
+     * swe-lite：clone 指定 repo 并 checkout 到起点 commit，然后<b>丢弃原仓库历史</b>，
+     * 用当前树重建一个单 commit 的 baseline。
+     *
+     * <p>丢历史是刻意的：Agent 不该能 {@code git log} 看到修复该 bug 的那次提交，
+     * 否则评的是"会不会翻历史"而不是"会不会修 bug"。diff 口径也因此和 fixture 用例一致。</p>
+     */
+    private static Workspace provisionFromGit(CaseSpec.GitSource source, Path workspaceDir) throws Exception {
+        Path cloneDir = workspaceDir.resolveSibling(workspaceDir.getFileName() + "-clone");
+        deleteRecursively(cloneDir);
+        try (Git cloned = Git.cloneRepository()
+                .setURI(toUri(source.repo()))
+                .setDirectory(cloneDir.toFile())
+                .setNoCheckout(source.commit() != null)
+                .call()) {
+            if (source.commit() != null) {
+                cloned.checkout().setName(source.commit()).call();
+            }
+        }
+        copyRecursively(cloneDir, workspaceDir, path -> !path.getFileName().toString().equals(".git"));
+        deleteRecursively(cloneDir);
+
+        Git git = Git.init().setDirectory(workspaceDir.toFile()).setInitialBranch("main").call();
+        git.add().addFilepattern(".").call();
+        commitBaseline(git);
+        return new Workspace(workspaceDir, git);
+    }
+
+    private static void commitBaseline(Git git) throws Exception {
         git.commit()
                 .setMessage("eval baseline")
                 .setAuthor("paicli-eval", "eval@paicli.local")
@@ -54,7 +91,12 @@ public final class Workspace implements AutoCloseable {
                 .setSign(false)
                 .setAllowEmpty(true)
                 .call();
-        return new Workspace(workspaceDir, git);
+    }
+
+    /** JGit 需要 URI 形式；本地路径直接给绝对路径即可。 */
+    private static String toUri(String repo) {
+        Path local = Path.of(repo);
+        return Files.isDirectory(local) ? local.toAbsolutePath().normalize().toString() : repo;
     }
 
     public Path root() {
@@ -100,20 +142,46 @@ public final class Workspace implements AutoCloseable {
     }
 
     private static void copyRecursively(Path source, Path target) throws IOException {
+        copyRecursively(source, target, path -> true);
+    }
+
+    private static void copyRecursively(Path source, Path target, Predicate<Path> accept) throws IOException {
         Files.walkFileTree(source, new SimpleFileVisitor<>() {
             @Override
             public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) throws IOException {
+                if (!accept.test(dir)) {
+                    return FileVisitResult.SKIP_SUBTREE;
+                }
                 Files.createDirectories(target.resolve(source.relativize(dir).toString()));
                 return FileVisitResult.CONTINUE;
             }
 
             @Override
             public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
-                Files.copy(file, target.resolve(source.relativize(file).toString()),
-                        StandardCopyOption.REPLACE_EXISTING);
+                if (accept.test(file)) {
+                    Files.copy(file, target.resolve(source.relativize(file).toString()),
+                            StandardCopyOption.REPLACE_EXISTING);
+                }
                 return FileVisitResult.CONTINUE;
             }
         });
+    }
+
+    private static void deleteRecursively(Path dir) {
+        if (!Files.exists(dir)) {
+            return;
+        }
+        try (Stream<Path> paths = Files.walk(dir)) {
+            paths.sorted(Comparator.reverseOrder()).forEach(p -> {
+                try {
+                    Files.deleteIfExists(p);
+                } catch (IOException ignored) {
+                    // Windows 文件锁：留给人工清理
+                }
+            });
+        } catch (IOException ignored) {
+            // 目录已不存在
+        }
     }
 
     @Override

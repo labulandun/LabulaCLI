@@ -6,9 +6,9 @@ public final class GraderFactory {
     private GraderFactory() {
     }
 
-    public static Grader create(GraderSpec spec) {
+    public static Grader create(GraderSpec spec, CommandRunner runner) {
         return switch (spec.type()) {
-            case "command" -> new CommandGrader(spec);
+            case "command" -> new CommandGrader(spec, runner);
             case "output_assert" -> new OutputAssertGrader(spec);
             case "file_assert" -> new FileAssertGrader(spec);
             case "tool_selection" -> new ToolSelectionGrader(spec);

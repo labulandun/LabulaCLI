@@ -1,0 +1,21 @@
+{
+  "id": "swe-002-null-category-crash",
+  "suite": "swe-lite",
+  "workspace": { "fixture": "../_shared/ledger" },
+  "prompt": "线上报错：从 CSV 导入的记录里有些 category 字段是空的，之后只要调用一次按类别筛选就抛 NullPointerException。期望是 category 为 null 的记录能被 byCategory(null) 正常筛出来，而按具体类别筛选时不受这些记录影响，也不要再崩。请修复。",
+  "timeout_seconds": 900,
+  "graders": [
+    {
+      "type": "command",
+      "name": "fail_to_pass",
+      "cmd": "javac -d out src/*.java verify/FailToPass.java && java -cp out FailToPass",
+      "copy_from_case": ["verify/FailToPass.java"]
+    },
+    {
+      "type": "command",
+      "name": "pass_to_pass",
+      "cmd": "javac -d out src/*.java verify/PassToPass.java && java -cp out PassToPass",
+      "copy_from_case": ["verify/PassToPass.java"]
+    }
+  ]
+}

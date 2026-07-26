@@ -1,0 +1,21 @@
+{
+  "id": "swe-001-negative-money-format",
+  "suite": "swe-lite",
+  "workspace": { "fixture": "../_shared/ledger" },
+  "prompt": "用户报了个 bug：账本里加一条 5 分钱的退款（amountCents = -5）之后，报表那一行输出成了 `refund [refund] 0.0-5`，金额显示不对。正数记录显示正常，整数元的退款（比如 -500）看起来也正常。麻烦排查并修复。",
+  "timeout_seconds": 900,
+  "graders": [
+    {
+      "type": "command",
+      "name": "fail_to_pass",
+      "cmd": "javac -d out src/*.java verify/FailToPass.java && java -cp out FailToPass",
+      "copy_from_case": ["verify/FailToPass.java"]
+    },
+    {
+      "type": "command",
+      "name": "pass_to_pass",
+      "cmd": "javac -d out src/*.java verify/PassToPass.java && java -cp out PassToPass",
+      "copy_from_case": ["verify/PassToPass.java"]
+    }
+  ]
+}

@@ -22,7 +22,13 @@ final class EvalFixtures {
     }
 
     static CaseSpec caseSpec(String id, String suite, Path caseDir, Path fixtureDir) {
-        return new CaseSpec(id, suite, "prompt", 600, 1, "host", null, caseDir, fixtureDir, List.of());
+        return new CaseSpec(id, suite, "prompt", 600, 1, "host", null,
+                caseDir, fixtureDir, null, null, List.of());
+    }
+
+    static CaseSpec gitCaseSpec(String id, Path caseDir, CaseSpec.GitSource git) {
+        return new CaseSpec(id, "swe-lite", "prompt", 600, 1, "host", null,
+                caseDir, null, git, null, List.of());
     }
 
     static RunArtifact artifact(String caseId) {

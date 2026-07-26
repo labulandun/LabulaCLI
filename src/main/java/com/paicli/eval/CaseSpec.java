@@ -8,8 +8,11 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 一条评测用例，对应 eval/suites/<suite>/<case-id>/case.json。
- * schema 见 docs/evaluation-system-design.md §2.3；E1 只使用其中 host 沙盒相关字段。
+ * 一条评测用例，对应 eval/suites/&lt;suite&gt;/&lt;case-id&gt;/case.json。
+ * schema 见 docs/evaluation-system-design.md §2.3。
+ *
+ * @param gitSource 非 null 时从 git 仓库快照建工作区（swe-lite 用），与 fixtureDir 二选一
+ * @param setupCmd  provision 之后、Agent 启动之前跑一次，用来保证起点可编译
  */
 public record CaseSpec(String id,
                        String suite,
@@ -20,9 +23,15 @@ public record CaseSpec(String id,
                        String dockerImage,
                        Path caseDir,
                        Path fixtureDir,
+                       GitSource gitSource,
+                       String setupCmd,
                        List<GraderSpec> graders) {
 
     public static final int DEFAULT_TIMEOUT_SECONDS = 600;
+
+    /** @param repo 本地路径或 URL；本地路径优先，评测才能离线且快 */
+    public record GitSource(String repo, String commit) {
+    }
 
     public static CaseSpec parse(Path caseDir, String suite, JsonNode root) {
         String id = root.path("id").asText("");
@@ -45,14 +54,21 @@ public record CaseSpec(String id,
             }
             graders.add(new GraderSpec(type, node));
         }
+
+        JsonNode workspaceNode = root.path("workspace");
         Path fixtureDir = null;
-        String fixture = root.path("workspace").path("fixture").asText("");
+        String fixture = workspaceNode.path("fixture").asText("");
         if (!fixture.isBlank()) {
             fixtureDir = caseDir.resolve(fixture).normalize();
             if (!Files.isDirectory(fixtureDir)) {
                 throw new IllegalArgumentException("fixture 目录不存在: " + fixtureDir + " (case " + id + ")");
             }
         }
+        GitSource gitSource = parseGit(caseDir, id, workspaceNode.path("git"));
+        if (fixtureDir != null && gitSource != null) {
+            throw new IllegalArgumentException("workspace.fixture 与 workspace.git 只能二选一: " + id);
+        }
+
         return new CaseSpec(
                 id,
                 root.path("suite").asText(suite),
@@ -63,6 +79,22 @@ public record CaseSpec(String id,
                 root.path("docker_image").asText(null),
                 caseDir,
                 fixtureDir,
+                gitSource,
+                root.path("setup_cmd").asText(null),
                 List.copyOf(graders));
+    }
+
+    private static GitSource parseGit(Path caseDir, String id, JsonNode gitNode) {
+        if (gitNode.isMissingNode() || gitNode.isNull()) {
+            return null;
+        }
+        String repo = gitNode.path("repo").asText("");
+        if (repo.isBlank()) {
+            throw new IllegalArgumentException("workspace.git 缺少 repo: " + id);
+        }
+        // 相对路径按 case 目录解析，便于把 mini-repo 放在 suite 里
+        Path localRepo = caseDir.resolve(repo).normalize();
+        String resolved = Files.isDirectory(localRepo) ? localRepo.toString() : repo;
+        return new GitSource(resolved, gitNode.path("commit").asText(null));
     }
 }

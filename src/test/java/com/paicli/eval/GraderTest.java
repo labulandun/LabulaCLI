@@ -78,13 +78,15 @@ class GraderTest {
 
     @Test
     void commandGraderScoresByExitCode() throws Exception {
-        List<Score> pass = new CommandGrader(spec("command", "cmd", "echo eval-ok"))
+        CommandRunner runner = new CommandRunner.Host();
+        List<Score> pass = new CommandGrader(spec("command", "cmd", "echo eval-ok"), runner)
                 .grade(caseSpec(), artifact(""), workspace);
         assertTrue(pass.get(0).passed());
         assertEquals("tests_pass", pass.get(0).name());
         assertTrue(pass.get(0).comment().contains("eval-ok"));
+        assertTrue(pass.get(0).comment().contains("@host"));
 
-        List<Score> fail = new CommandGrader(spec("command", "cmd", "exit 3"))
+        List<Score> fail = new CommandGrader(spec("command", "cmd", "exit 3"), runner)
                 .grade(caseSpec(), artifact(""), workspace);
         assertFalse(fail.get(0).passed());
     }
@@ -92,6 +94,6 @@ class GraderTest {
     @Test
     void graderFactoryRejectsUnknownType() {
         assertThrows(IllegalArgumentException.class,
-                () -> GraderFactory.create(spec("no_such_grader")));
+                () -> GraderFactory.create(spec("no_such_grader"), new CommandRunner.Host()));
     }
 }

@@ -1,0 +1,21 @@
+{
+  "id": "swe-003-report-subtotals",
+  "suite": "swe-lite",
+  "workspace": { "fixture": "../_shared/ledger" },
+  "prompt": "需求：报表需要按类别给出小计。在现有明细行和 TOTAL 行之间插入小计段——先输出一行 `SUBTOTAL`，随后每个类别一行，格式为 `  <类别> <金额>`（两个空格缩进），类别按首次出现顺序排列，金额沿用现有的金额格式。明细行和 TOTAL 行保持原样不要改。",
+  "timeout_seconds": 900,
+  "graders": [
+    {
+      "type": "command",
+      "name": "fail_to_pass",
+      "cmd": "javac -d out src/*.java verify/FailToPass.java && java -cp out FailToPass",
+      "copy_from_case": ["verify/FailToPass.java"]
+    },
+    {
+      "type": "command",
+      "name": "pass_to_pass",
+      "cmd": "javac -d out src/*.java verify/PassToPass.java && java -cp out PassToPass",
+      "copy_from_case": ["verify/PassToPass.java"]
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "id": "tm-004-missing-config",
+  "suite": "terminal",
+  "sandbox": "docker",
+  "workspace": { "fixture": "fixture" },
+  "prompt": "`sh run.sh` 起不来。按 README 的说明把缺的东西补齐，让它能正常打印监听信息。不要改 run.sh。",
+  "timeout_seconds": 900,
+  "graders": [
+    { "type": "command", "name": "service_starts", "cmd": "sh run.sh | grep -q 'listening on 8080 with 4 workers'" },
+    { "type": "file_assert", "name": "config_created", "path": "app.conf", "contains": "APP_PORT" },
+    { "type": "file_assert", "name": "runner_untouched", "path": "run.sh", "contains": "APP_WORKERS must be >= 1" }
+  ]
+}

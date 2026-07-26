@@ -51,6 +51,19 @@ public final class Reporter {
         summary.put("tool_errors", toolErrors);
         summary.put("tool_error_rate", toolCalls == 0 ? 0.0 : round4((double) toolErrors / toolCalls));
 
+        List<PassAtK> passAtK = passAtK(executed);
+        long solved = passAtK.stream().filter(PassAtK::solved).count();
+        summary.put("cases_with_runs", passAtK.size());
+        summary.put("pass_at_k", passAtK.isEmpty() ? 0.0 : round4((double) solved / passAtK.size()));
+        ArrayNode passAtKNode = summary.putArray("pass_at_k_detail");
+        for (PassAtK entry : passAtK) {
+            ObjectNode node = passAtKNode.addObject();
+            node.put("case_id", entry.caseId());
+            node.put("k", entry.k());
+            node.put("passed_runs", entry.passedRuns());
+            node.put("solved", entry.solved());
+        }
+
         ObjectNode suites = summary.putObject("suites");
         for (Map.Entry<String, List<CaseResult>> entry : groupBySuite(executed).entrySet()) {
             long suitePassed = entry.getValue().stream().filter(CaseResult::taskSuccess).count();
@@ -117,11 +130,13 @@ public final class Reporter {
             md.append(String.format("（另有 %d 条 skipped）", results.size() - executed.size()));
         }
         md.append("\n\n");
+        appendPassAtKSection(md, executed);
         md.append("| case | status | task_success | wall_time | tokens | rounds | tools | files± | scores |\n");
         md.append("|------|--------|--------------|-----------|--------|--------|-------|--------|--------|\n");
         for (CaseResult result : results) {
             md.append(String.format("| %s | %s | %s | %.1fs | %d | %d | %d(%dE) | %d(+%d/-%d) | %s |\n",
-                    result.caseId(),
+                    // 多遍运行时带上轮次，否则同名行看起来像重复
+                    result.runIndex() > 1 ? result.caseId() + " #" + result.runIndex() : result.caseId(),
                     result.artifact().status(),
                     result.executed() ? (result.taskSuccess() ? "✅" : "❌") : "⏭",
                     result.artifact().wallTimeMs() / 1000.0,
@@ -153,6 +168,34 @@ public final class Reporter {
             }
         }
         return md.toString();
+    }
+
+    /**
+     * 只在真的跑了多遍时才列 pass@k：k=1 时它恒等于 pass_rate，多印一遍是噪音。
+     * 同时把"多遍里时好时坏"的 case 单独点出来——那是抖动，不是能力。
+     */
+    private static void appendPassAtKSection(StringBuilder md, List<CaseResult> executed) {
+        List<PassAtK> entries = passAtK(executed);
+        if (entries.stream().allMatch(e -> e.k() <= 1)) {
+            return;
+        }
+        long solved = entries.stream().filter(PassAtK::solved).count();
+        md.append(String.format("**pass@k: %d/%d**（至少成功一遍）%n%n", solved, entries.size()));
+        md.append("| case | k | 通过 | pass@k |\n");
+        md.append("|------|---|------|--------|\n");
+        for (PassAtK entry : entries) {
+            md.append(String.format("| %s | %d | %d | %s |%n",
+                    entry.caseId(), entry.k(), entry.passedRuns(), entry.solved() ? "✅" : "❌"));
+        }
+        List<PassAtK> flaky = entries.stream()
+                .filter(e -> e.k() > 1 && e.passedRuns() > 0 && e.passedRuns() < e.k())
+                .toList();
+        if (!flaky.isEmpty()) {
+            md.append("\n结果不稳定（同一条用例多遍里有成有败）：");
+            md.append(flaky.stream().map(PassAtK::caseId).collect(java.util.stream.Collectors.joining("、")));
+            md.append("\n");
+        }
+        md.append('\n');
     }
 
     /**
@@ -207,6 +250,39 @@ public final class Reporter {
             sb.append(score.name()).append('=').append(score.passed() ? "1" : "0");
         }
         return sb.length() == 0 ? "-" : sb.toString();
+    }
+
+    /**
+     * @param k          该 case 实际跑了几遍
+     * @param passedRuns 其中通过几遍
+     * @param solved     k 遍里至少成功一遍（pass@k 口径）
+     */
+    record PassAtK(String caseId, int k, int passedRuns, boolean solved) {
+    }
+
+    /** 按 case 聚合多次运行。k=1 时 pass@k 等价于 pass_rate，抗随机性要靠 case.json 里配 runs>1。 */
+    static List<PassAtK> passAtK(List<CaseResult> executed) {
+        Map<String, List<CaseResult>> byCase = new LinkedHashMap<>();
+        for (CaseResult result : executed) {
+            byCase.computeIfAbsent(result.caseId(), k -> new java.util.ArrayList<>()).add(result);
+        }
+        List<PassAtK> entries = new java.util.ArrayList<>();
+        byCase.forEach((caseId, runs) -> {
+            int passed = (int) runs.stream().filter(CaseResult::taskSuccess).count();
+            entries.add(new PassAtK(caseId, runs.size(), passed, passed > 0));
+        });
+        return entries;
+    }
+
+    /** 给 CLI 收尾行用的一句话摘要，例如 "8/10 (k=3)"。 */
+    public static String passAtKSummary(List<CaseResult> results) {
+        List<PassAtK> entries = passAtK(results.stream().filter(CaseResult::executed).toList());
+        if (entries.isEmpty()) {
+            return "n/a";
+        }
+        long solved = entries.stream().filter(PassAtK::solved).count();
+        int maxK = entries.stream().mapToInt(PassAtK::k).max().orElse(1);
+        return solved + "/" + entries.size() + " (k=" + maxK + ")";
     }
 
     private static Map<String, List<CaseResult>> groupBySuite(List<CaseResult> executed) {

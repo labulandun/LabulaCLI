@@ -19,14 +19,19 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 /**
  * 评测体系 Phase E1 入口（独立 main，不进入 CLI 运行时路径）：
  *
  *   java -cp target/paicli-1.0-SNAPSHOT.jar com.paicli.eval.EvalMain --suite custom
  *
- * 每条 case：provision 工作区 → 启动 PaiCLI serve 子进程 → Runtime API 提交任务 →
- * 轮询到终态 → 收集工件 → 逐 grader 打分 → 汇总 report。
+ * 每条 case：provision 工作区 → 可选 setup_cmd → 启动 PaiCLI serve 子进程 →
+ * Runtime API 提交任务 → 轮询到终态 → 收集工件 → 逐 grader 打分 → 汇总 report。
+ * 每个 (case, run) 单元自带独立工作区与子进程，默认并发 4。
  * 总设计见 docs/evaluation-system-design.md。
  */
 public final class EvalMain {
@@ -64,6 +69,8 @@ public final class EvalMain {
                 ? Integer.parseInt(options.get("timeout")) : null;
         Map<String, String> dotEnv = DotEnv.read(projectRoot.resolve(".env"));
         SecretRedactor redactor = new SecretRedactor(dotEnv);
+        int concurrency = Math.max(1, Integer.parseInt(options.getOrDefault("concurrency", "4")));
+        PortAllocator ports = new PortAllocator();
 
         Map<String, String> runMeta = new LinkedHashMap<>();
         runMeta.put("run_id", runId);
@@ -71,6 +78,7 @@ public final class EvalMain {
         runMeta.put("git_commit", projectGitCommit(projectRoot));
         runMeta.put("jar", jar.toString());
         runMeta.put("suites", String.join(",", suites));
+        runMeta.put("concurrency", String.valueOf(concurrency));
         writeJson(runDir.resolve("run-meta.json"), toObjectNode(runMeta));
 
         System.out.println("🧪 PaiCLI Eval run " + runId + "：共 " + cases.size() + " 条用例");
@@ -83,6 +91,9 @@ public final class EvalMain {
         }
 
         List<CaseResult> results = new ArrayList<>();
+        List<Runnable> units = new ArrayList<>();
+        // 结果按提交顺序回填，保证报告顺序与 case 顺序一致，不受完成先后影响
+        List<CaseResult> slots = new ArrayList<>();
         for (CaseSpec spec : cases) {
             String skipReason = sandboxSkipReason(spec, docker);
             if (skipReason != null) {
@@ -91,20 +102,57 @@ public final class EvalMain {
                 continue;
             }
             for (int runIndex = 1; runIndex <= spec.runs(); runIndex++) {
-                CaseResult result = runCase(spec, runIndex, timeoutOverride, jar, runDir, dotEnv,
-                        redactor, keepWorkspace);
-                results.add(result);
-                System.out.println((result.taskSuccess() ? "✅ " : "❌ ") + spec.id()
-                        + " run-" + runIndex + " (" + result.artifact().status()
-                        + ", " + result.artifact().wallTimeMs() / 1000 + "s)");
+                int slot = slots.size();
+                int currentRun = runIndex;
+                slots.add(null);
+                units.add(() -> {
+                    CaseResult result = runCase(spec, currentRun, timeoutOverride, jar, runDir, dotEnv,
+                            redactor, ports, keepWorkspace);
+                    slots.set(slot, result);
+                    System.out.println((result.taskSuccess() ? "✅ " : "❌ ") + spec.id()
+                            + " run-" + currentRun + " (" + result.artifact().status()
+                            + ", " + result.artifact().wallTimeMs() / 1000 + "s)");
+                });
             }
         }
+        runUnits(units, concurrency);
+        slots.stream().filter(java.util.Objects::nonNull).forEach(results::add);
 
         Reporter.write(runDir, runMeta, results);
         long executed = results.stream().filter(CaseResult::executed).count();
         long passed = results.stream().filter(CaseResult::taskSuccess).count();
         System.out.println("\n📊 pass_rate: " + passed + "/" + executed
+                + "，pass@k: " + Reporter.passAtKSummary(results)
                 + "，报告: " + runDir.resolve("report.md"));
+    }
+
+    /** 每个 unit 自带独立工作区与子进程，天然可并行；并发数由 --concurrency 限制。 */
+    private static void runUnits(List<Runnable> units, int concurrency) throws InterruptedException {
+        if (units.isEmpty()) {
+            return;
+        }
+        if (concurrency <= 1) {
+            units.forEach(Runnable::run);
+            return;
+        }
+        ExecutorService pool = Executors.newFixedThreadPool(Math.min(concurrency, units.size()), r -> {
+            Thread thread = new Thread(r, "paicli-eval-worker");
+            thread.setDaemon(true);
+            return thread;
+        });
+        try {
+            List<Future<?>> futures = units.stream().map(pool::submit).toList();
+            for (Future<?> future : futures) {
+                try {
+                    future.get();
+                } catch (ExecutionException e) {
+                    // runCase 内部已把异常转成 error 结果，走到这里说明是回填逻辑本身出问题
+                    System.err.println("⚠️ 评测单元异常: " + e.getCause());
+                }
+            }
+        } finally {
+            pool.shutdownNow();
+        }
     }
 
     private static CaseResult runCase(CaseSpec spec,
@@ -114,15 +162,19 @@ public final class EvalMain {
                                       Path runDir,
                                       Map<String, String> dotEnv,
                                       SecretRedactor redactor,
+                                      PortAllocator ports,
                                       boolean keepWorkspace) {
         Path caseRunDir = runDir.resolve("cases").resolve(spec.id()).resolve("run-" + runIndex);
         Workspace workspace = null;
         PaiCliProcess process = null;
+        CommandRunner commandRunner = CommandRunner.forCase(spec);
+        int port = -1;
         long startNanos = System.nanoTime();
         try {
             workspace = Workspace.provision(spec, caseRunDir.resolve("workspace"));
             plantCanary(caseRunDir.resolve("canary"));
-            int port = PaiCliProcess.freePort();
+            runSetup(spec, workspace.root(), commandRunner);
+            port = ports.allocate();
             String apiKey = "eval-" + UUID.randomUUID();
             Path outDir = caseRunDir.resolve("out");
             Path spansFile = outDir.resolve("spans.jsonl");
@@ -164,7 +216,7 @@ public final class EvalMain {
             Files.writeString(caseRunDir.resolve("workspace.diff"),
                     redactor.redact(diff.patch()), StandardCharsets.UTF_8);
 
-            List<Score> scores = gradeAll(spec, artifact, workspace.root());
+            List<Score> scores = gradeAll(spec, artifact, workspace.root(), commandRunner);
             scores.addAll(SpanArtifacts.metricScores(artifact));
             CaseResult result = CaseResult.of(spec, runIndex, artifact, scores);
             writeArtifactJson(caseRunDir.resolve("artifact.json"), result);
@@ -184,6 +236,9 @@ public final class EvalMain {
             if (process != null) {
                 process.stop();
             }
+            if (port > 0) {
+                ports.release(port);
+            }
             if (workspace != null) {
                 if (keepWorkspace) {
                     workspace.close();
@@ -191,6 +246,21 @@ public final class EvalMain {
                     workspace.deleteQuietly();
                 }
             }
+        }
+    }
+
+    /**
+     * provision 之后、Agent 启动之前跑一次，用来保证起点可编译（swe-lite / terminal 常需要）。
+     * 失败直接抛：起点就坏了的话，后面测出来的是环境问题不是模型能力。
+     */
+    private static void runSetup(CaseSpec spec, Path workspace, CommandRunner runner) throws Exception {
+        if (spec.setupCmd() == null || spec.setupCmd().isBlank()) {
+            return;
+        }
+        CommandRunner.Result result = runner.run(workspace, spec.setupCmd(), 600);
+        if (result.timedOut() || result.exitCode() != 0) {
+            throw new IllegalStateException("setup_cmd 失败 (exit=" + result.exitCode()
+                    + ", @" + runner.describe() + "): " + spec.setupCmd() + "\n" + result.output());
         }
     }
 
@@ -222,11 +292,12 @@ public final class EvalMain {
     }
 
     /** 单个 grader 抛异常不拖垮整条 case：记 0 分并把原因写进 comment。 */
-    private static List<Score> gradeAll(CaseSpec spec, RunArtifact artifact, Path workspaceRoot) {
+    private static List<Score> gradeAll(CaseSpec spec, RunArtifact artifact, Path workspaceRoot,
+                                        CommandRunner runner) {
         List<Score> scores = new ArrayList<>();
         for (GraderSpec graderSpec : spec.graders()) {
             try {
-                scores.addAll(GraderFactory.create(graderSpec).grade(spec, artifact, workspaceRoot));
+                scores.addAll(GraderFactory.create(graderSpec, runner).grade(spec, artifact, workspaceRoot));
             } catch (Exception e) {
                 scores.add(Score.bool(graderSpec.type() + "_error", false, "grader 异常: " + describe(e)));
             }
@@ -302,6 +373,7 @@ public final class EvalMain {
                   --eval-home <dir>    eval 根目录（默认 eval）
                   --out <dir>          输出目录（默认 eval/runs）
                   --timeout <seconds>  覆盖所有 case 的超时
+                  --concurrency <n>    并行执行的 case 数（默认 4，设 1 退回串行）
                   --keep-workspace     保留工作区现场用于排查（safety 用例排查时建议开）
                   --help               显示本帮助
                 """);

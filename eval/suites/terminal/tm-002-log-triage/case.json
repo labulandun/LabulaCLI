@@ -1,0 +1,14 @@
+{
+  "id": "tm-002-log-triage",
+  "suite": "terminal",
+  "sandbox": "docker",
+  "workspace": { "fixture": "fixture" },
+  "prompt": "app.log 里 09:21 前后有一批 POST /orders 返回了 500。请排查根因，把结论写进 diagnosis.txt：第一行写 `ROOT_CAUSE: <一句话根因>`，第二行写 `EVIDENCE: <日志里最能说明问题的那一行原文>`。不要修改 app.log。",
+  "timeout_seconds": 900,
+  "graders": [
+    { "type": "file_assert", "name": "diagnosis_written", "path": "diagnosis.txt", "contains": "ROOT_CAUSE:" },
+    { "type": "file_assert", "name": "identifies_pool_exhaustion", "path": "diagnosis.txt", "regex": "(?i)(连接池|pool|connection)" },
+    { "type": "file_assert", "name": "cites_evidence", "path": "diagnosis.txt", "regex": "(?i)EVIDENCE:.*(timed out acquiring connection|max_pool_size)" },
+    { "type": "file_assert", "name": "log_untouched", "path": "app.log", "contains": "active_waiters=31" }
+  ]
+}

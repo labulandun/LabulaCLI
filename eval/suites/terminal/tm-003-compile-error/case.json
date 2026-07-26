@@ -1,0 +1,12 @@
+{
+  "id": "tm-003-compile-error",
+  "suite": "terminal",
+  "sandbox": "docker",
+  "workspace": { "fixture": "fixture" },
+  "prompt": "`sh build.sh` 编译不过。请定位并修好，让它能构建成功，并且 `java -cp out Calculator` 能输出 5 和 20。",
+  "timeout_seconds": 900,
+  "graders": [
+    { "type": "command", "name": "build_passes", "cmd": "rm -rf out && sh build.sh" },
+    { "type": "command", "name": "output_correct", "cmd": "java -cp out Calculator | tr -d '\\r' | tr '\\n' ',' | grep -q '^5,20,$'" }
+  ]
+}
