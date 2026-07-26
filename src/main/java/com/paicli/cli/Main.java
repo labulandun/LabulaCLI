@@ -28,6 +28,8 @@ import com.paicli.mcp.McpServer;
 import com.paicli.mcp.McpServerManager;
 import com.paicli.mcp.McpServerStatus;
 import com.paicli.mcp.mention.AtMentionExpander;
+import com.paicli.observability.OpenTelemetryBootstrap;
+import com.paicli.observability.PaiCliTracing;
 import com.paicli.plan.ExecutionPlan;
 import com.paicli.rag.CodeIndex;
 import com.paicli.hitl.ApprovalPolicy;
@@ -192,13 +194,20 @@ public class Main {
 
     public static void main(String[] args) {
         configureAwtForCli();
+        configureLogging();
+        try (OpenTelemetryBootstrap telemetry =
+                     OpenTelemetryBootstrap.initialize(key -> loadConfigValue(key, null))) {
+            Runtime.getRuntime().addShutdownHook(
+                    new Thread(telemetry::close, "paicli-opentelemetry-shutdown"));
+            run(args, telemetry.tracing());
+        }
+    }
+
+    private static void run(String[] args, PaiCliTracing tracing) {
         if (isRuntimeServeCommand(args)) {
-            configureLogging();
-            startRuntimeApiAndBlock(args);
+            startRuntimeApiAndBlock(args, tracing);
             return;
         }
-
-        configureLogging();
 
         PaiCliConfig config = PaiCliConfig.load();
         LlmClient llmClient = LlmClientFactory.createFromConfig(config);
@@ -299,11 +308,11 @@ public class Main {
             hitlToolRegistry.setSkillRegistry(skillRegistry);
             hitlToolRegistry.setSkillContextBuffer(skillContextBuffer);
 
-            Agent reactAgent = new Agent(llmClient, hitlToolRegistry);
+            Agent reactAgent = new Agent(llmClient, hitlToolRegistry, tracing);
             reactAgent.setExternalContextSupplier(mcpServerManager::resourceIndexForPrompt);
             reactAgent.setSkillRegistry(skillRegistry);
             reactAgent.setSkillContextBuffer(skillContextBuffer);
-            DurableTaskManager taskManager = openTaskManager(llmClientRef);
+            DurableTaskManager taskManager = openTaskManager(llmClientRef, tracing);
             taskManager.start();
             Runtime.getRuntime().addShutdownHook(new Thread(taskManager::close, "paicli-task-shutdown"));
             renderer.updateStatus(statusInfo(reactAgent, mcpServerManager, skillRegistry, "idle"));
@@ -780,7 +789,7 @@ public class Main {
                 && java.util.Arrays.stream(args).anyMatch("--http"::equalsIgnoreCase);
     }
 
-    private static void startRuntimeApiAndBlock(String[] args) {
+    private static void startRuntimeApiAndBlock(String[] args, PaiCliTracing tracing) {
         PaiCliConfig config = PaiCliConfig.load();
         LlmClient client = LlmClientFactory.createFromConfig(config);
         if (client == null) {
@@ -792,9 +801,10 @@ public class Main {
             RuntimeThreadStore store = new RuntimeThreadStore(RuntimeThreadStore.defaultDbPath());
             RuntimeApiServer server = new RuntimeApiServer(
                     store,
-                    prompt -> runHeadlessTask(prompt, client),
+                    prompt -> runHeadlessTask(prompt, client, tracing),
                     port,
-                    RuntimeApiServer.configuredApiKey());
+                    RuntimeApiServer.configuredApiKey(),
+                    tracing::takeLastCompletedRun);
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 server.close();
                 store.close();
@@ -827,16 +837,16 @@ public class Main {
         return defaultPort;
     }
 
-    private static String runHeadlessTask(String prompt, LlmClient llmClient) {
+    private static String runHeadlessTask(String prompt, LlmClient llmClient, PaiCliTracing tracing) {
         ToolRegistry registry = new ToolRegistry();
         registry.setProjectPath(Path.of(".").toAbsolutePath().normalize().toString());
-        Agent agent = new Agent(llmClient, registry);
+        Agent agent = new Agent(llmClient, registry, tracing);
         return agent.run(prompt);
     }
 
-    private static DurableTaskManager openTaskManager(AtomicReference<LlmClient> llmClientRef) {
+    private static DurableTaskManager openTaskManager(AtomicReference<LlmClient> llmClientRef, PaiCliTracing tracing) {
         try {
-            return DurableTaskManager.openDefault(prompt -> runHeadlessTask(prompt, llmClientRef.get()));
+            return DurableTaskManager.openDefault(prompt -> runHeadlessTask(prompt, llmClientRef.get(), tracing));
         } catch (Exception e) {
             throw new IllegalStateException("后台任务管理器初始化失败: " + e.getMessage(), e);
         }

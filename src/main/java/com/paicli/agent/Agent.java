@@ -8,6 +8,7 @@ import com.paicli.lsp.LspDiagnosticReport;
 import com.paicli.memory.ConversationHistoryCompactor;
 import com.paicli.memory.ExplicitMemoryHints;
 import com.paicli.memory.MemoryManager;
+import com.paicli.observability.PaiCliTracing;
 import com.paicli.prompt.PromptAssembler;
 import com.paicli.prompt.PromptContext;
 import com.paicli.prompt.PromptMode;
@@ -39,6 +40,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
@@ -61,6 +63,8 @@ public class Agent {
     private static final Set<String> SEARCH_TOOL_NAMES = Set.of(
             "grep_code", "glob_files", "read_file");
     private int consecutiveSearchToolCalls;
+    private final PaiCliTracing tracing;
+    private final String traceSessionId = UUID.randomUUID().toString();
 
     private LlmClient llmClient;
     private final ToolRegistry toolRegistry;
@@ -76,17 +80,23 @@ public class Agent {
     private final Semaphore explorerSemaphore = new Semaphore(MAX_PARALLEL_EXPLORERS);
 
     public Agent(LlmClient llmClient) {
-        this(llmClient, new ToolRegistry());
+        this(llmClient, new ToolRegistry(), PaiCliTracing.noop());
     }
 
     public Agent(LlmClient llmClient, ToolRegistry toolRegistry) {
-        this.llmClient = llmClient;
+        this(llmClient, toolRegistry, PaiCliTracing.noop());
+    }
+
+    public Agent(LlmClient llmClient, ToolRegistry toolRegistry, PaiCliTracing tracing) {
+        this.tracing = tracing == null ? PaiCliTracing.noop() : tracing;
+        this.llmClient = this.tracing.traceLlmClient(llmClient);
         this.toolRegistry = toolRegistry;
         this.conversationHistory = new ArrayList<>();
-        this.memoryManager = new MemoryManager(llmClient);
-        this.historyCompactor = new ConversationHistoryCompactor(llmClient);
+        this.memoryManager = new MemoryManager(this.llmClient);
+        this.historyCompactor = new ConversationHistoryCompactor(this.llmClient);
+        this.toolRegistry.setTracing(this.tracing);
         this.toolRegistry.setContextProfile(memoryManager.getContextProfile());
-        this.toolRegistry.setCurrentModel(llmClient.getProviderName(), llmClient.getModelName());
+        this.toolRegistry.setCurrentModel(this.llmClient.getProviderName(), this.llmClient.getModelName());
         this.memoryManager.setProjectPath(this.toolRegistry.getProjectPath());
         this.toolRegistry.setScopedMemorySaver(memoryManager::storeFact);
         wireExploreRunner();
@@ -135,11 +145,11 @@ public class Agent {
     }
 
     public void setLlmClient(LlmClient llmClient) {
-        this.llmClient = llmClient;
-        this.memoryManager.setLlmClient(llmClient);
-        this.historyCompactor.setLlmClient(llmClient);
+        this.llmClient = tracing.traceLlmClient(llmClient);
+        this.memoryManager.setLlmClient(this.llmClient);
+        this.historyCompactor.setLlmClient(this.llmClient);
         this.toolRegistry.setContextProfile(memoryManager.getContextProfile());
-        this.toolRegistry.setCurrentModel(llmClient.getProviderName(), llmClient.getModelName());
+        this.toolRegistry.setCurrentModel(this.llmClient.getProviderName(), this.llmClient.getModelName());
     }
 
     public void setExternalContextSupplier(Supplier<String> externalContextSupplier) {
@@ -181,6 +191,22 @@ public class Agent {
      * 运行 Agent 循环
      */
     public String run(String userInput) {
+        try (PaiCliTracing.AgentRun traceRun = tracing.startAgentRun(
+                userInput, llmClient.getProviderName(), llmClient.getModelName(), traceSessionId)) {
+            try {
+                String result = runTraced(userInput, traceRun);
+                if (result != null && !result.isBlank()) {
+                    traceRun.outputIfAbsent(result);
+                }
+                return result;
+            } catch (RuntimeException e) {
+                traceRun.error(PaiCliTracing.RunOutcome.UNEXPECTED_ERROR, e);
+                throw e;
+            }
+        }
+    }
+
+    private String runTraced(String userInput, PaiCliTracing.AgentRun traceRun) {
         log.info("ReAct run started: inputLength={}", userInput == null ? 0 : userInput.length());
         pruneHistoricalImagePayloads();
         // 存入短期记忆
@@ -212,6 +238,7 @@ public class Agent {
             if (CancellationContext.isCancelled()) {
                 log.info("ReAct run cancelled before iteration");
                 pushStatus(budget, startNanos, "idle");
+                traceRun.outcome(PaiCliTracing.RunOutcome.CANCELLED, "用户在迭代开始前取消");
                 return "⏹️ 已取消当前任务。";
             }
             // 调 LLM 前评估 conversationHistory 是否接近 window 上限；超阈值就把早期消息压缩成摘要。
@@ -226,6 +253,7 @@ public class Agent {
                         exitReason, budget.iteration(),
                         budget.totalInputTokens() + budget.totalOutputTokens(), budget.tokenBudget());
                 pushStatus(budget, startNanos, "idle");
+                traceRun.outcome(PaiCliTracing.RunOutcome.BUDGET_EXHAUSTED, description);
                 return "❌ " + description;
             }
 
@@ -246,6 +274,7 @@ public class Agent {
                     log.info("ReAct run cancelled after LLM response");
                     streamRenderer.finish();
                     pushStatus(budget, startNanos, "idle");
+                    traceRun.outcome(PaiCliTracing.RunOutcome.CANCELLED, "用户在 LLM 响应后取消");
                     return "⏹️ 已取消当前任务。";
                 }
 
@@ -302,15 +331,19 @@ public class Agent {
                 }
 
                 if (streamRenderer.hasStreamedOutput()) {
+                    traceRun.output(response.content());
                     streamRenderer.finish();
                     return "";
                 }
                 streamRenderer.clearThinkingPanel();
-                return formatUserFacingResponse(reasoningTranscript.toString(), response.content());
+                String finalResponse = formatUserFacingResponse(reasoningTranscript.toString(), response.content());
+                traceRun.output(response.content());
+                return finalResponse;
 
             } catch (IOException e) {
                 log.error("LLM call failed in ReAct loop", e);
                 streamRenderer.finish();
+                traceRun.error(PaiCliTracing.RunOutcome.LLM_ERROR, e);
                 return "❌ 调用 LLM 失败: " + e.getMessage();
             }
         }

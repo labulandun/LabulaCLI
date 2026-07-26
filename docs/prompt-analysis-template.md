@@ -10,7 +10,7 @@
 
 ## Gap Analysis
 
-- 原 prompt 的问题：
+- 原 pmpt 的问ro题：
 - 新 prompt 如何解决：
 - 是否引入重复规则：
 - 是否引入互相冲突的规则：

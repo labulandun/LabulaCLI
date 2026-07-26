@@ -602,6 +602,20 @@
 **估算**：5–6 天
 
 ---
+## 横向能力：OpenTelemetry / Langfuse 可观测性 ✅ ReAct MVP
+
+- OpenTelemetry SDK 可选初始化、OTLP/HTTP 自动配置、fat jar ServiceLoader 合并与退出 flush 已落地
+- ReAct 一轮对应一个根 observation，LLM 调用对应 generation，工具调用对应 tool
+- generation 记录模型与 token usage；并行工具显式传播父上下文；Runtime API 返回 trace/root observation ID
+- reasoning、图片 base64 与常见凭据不导出，属性做 16 KiB 上限
+- 10 条 Dataset 与 `tests_pass` / `task_success` / `token_count` Score 作为最小验收闭环
+
+**当前边界**：Plan / Team / 独立 SubAgent 埋点、线上采样与自动评测 runner 留待最小闭环通过后扩展。
+
+详细文档：`docs/langfuse-mvp-observability.md`
+
+---
+
 ## 技术栈演进图
 
 ```
@@ -651,4 +665,4 @@ Git       Prompt    异步后台    图片
 
 ---
 
-*已完成第 16 期 TUI 产品化（含 16.1 形态修正：默认切换为 inline 流式 TUI，Lanterna 全屏 TUI 通过 `PAICLI_RENDERER=lanterna` 保留）、第 17 期 LSP 诊断注入 MVP、第 18 期 Git Side-History 快照与回滚 MVP、第 19 期 Prompt 分层架构 MVP、第 20 期后台任务 + Runtime API MVP、第 21 期图片复制粘贴输入 MVP。*
+*已完成第 16 期 TUI 产品化（含 16.1 形态修正：默认切换为 inline 流式 TUI，Lanterna 全屏 TUI 通过 `PAICLI_RENDERER=lanterna` 保留）、第 17 期 LSP 诊断注入 MVP、第 18 期 Git Side-History 快照与回滚 MVP、第 19 期 Prompt 分层架构 MVP、第 20 期后台任务 + Runtime API MVP、第 21 期图片复制粘贴输入 MVP，以及 OpenTelemetry / Langfuse ReAct 可观测性 MVP。*

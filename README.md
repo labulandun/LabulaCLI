@@ -205,6 +205,18 @@ v16.1 抽出 `Renderer` 接口 + 三个实现：
 - 新一轮 ReAct / SubAgent 任务开始前会省略历史 image payload，仅保留文本元信息，避免旧截图反复进入上下文；模型 `reasoning_content` 默认只写日志 / 展示，DeepSeek V4 / Kimi thinking tool-call 续轮会按 provider 协议带回上一轮 assistant reasoning
 - 当前边界：不做视频 / 音频、图像生成、TUI sixel 图片预览
 
+### OpenTelemetry / Langfuse 可观测性（ReAct MVP）
+
+- 已加入 OpenTelemetry Java SDK、OTLP exporter 与自动配置模块，默认未配置时不启动 exporter
+- 配置 `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` 后自动启用，也可用 `PAICLI_OTEL_ENABLED=true/false` 显式控制
+- 标准 OTEL 配置支持系统环境变量、项目 `.env` 和用户 `~/.env`；CLI 与 Runtime API 退出时会 flush 并关闭 SDK
+- Maven Shade 会合并依赖中的 ServiceLoader 描述，fat jar 可正常发现 OTLP exporter
+- ReAct 每轮创建 `paicli.react.run` 根 observation；LLM 调用创建 generation，工具调用创建 tool，并行工具会继承父上下文
+- generation 记录 model、输入/输出与 cached/input/output/total token；tool 记录 call id、参数、结果和错误
+- Runtime API 的完成/失败事件返回 `trace_id` 与 `root_observation_id`，可直接关联 Dataset Run 与 Score
+- reasoning、图片 base64 和常见凭据不会写入 Trace，单属性最大 16 KiB
+- 当前边界：尚未覆盖 Plan / Team / 独立 SubAgent；10 条 Dataset 与 `tests_pass` / `task_success` / `token_count` 验收流程见 `docs/langfuse-mvp-observability.md`
+
 ### 第六期 HITL 增强（路径围栏 / 命令快速拒绝 / 操作审计）
 
 `com.paicli.policy` 包，作为 HITL 之外的辅助层（不是沙箱、不提供进程隔离）：

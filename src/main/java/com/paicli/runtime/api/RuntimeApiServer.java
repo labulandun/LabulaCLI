@@ -2,6 +2,7 @@ package com.paicli.runtime.api;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.paicli.observability.PaiCliTracing;
 import com.paicli.runtime.task.TaskRunner;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
@@ -11,14 +12,17 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.function.Supplier;
 
 public class RuntimeApiServer implements AutoCloseable {
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private final RuntimeThreadStore store;
     private final TaskRunner runner;
     private final String apiKey;
+    private final Supplier<Optional<PaiCliTracing.TraceReference>> traceReferenceSupplier;
     private final HttpServer server;
     private final ExecutorService executor = Executors.newCachedThreadPool(r -> {
         Thread thread = new Thread(r, "paicli-runtime-api");
@@ -27,6 +31,14 @@ public class RuntimeApiServer implements AutoCloseable {
     });
 
     public RuntimeApiServer(RuntimeThreadStore store, TaskRunner runner, int port, String apiKey) throws IOException {
+        this(store, runner, port, apiKey, Optional::empty);
+    }
+
+    public RuntimeApiServer(RuntimeThreadStore store,
+                            TaskRunner runner,
+                            int port,
+                            String apiKey,
+                            Supplier<Optional<PaiCliTracing.TraceReference>> traceReferenceSupplier) throws IOException {
         if (apiKey == null || apiKey.isBlank()) {
             throw new IllegalArgumentException("Runtime API 需要配置 PAICLI_RUNTIME_API_KEY 或 -Dpaicli.runtime.api.key");
         }
@@ -35,6 +47,7 @@ public class RuntimeApiServer implements AutoCloseable {
         this.apiKey = apiKey;
         this.server = HttpServer.create(new InetSocketAddress("127.0.0.1", port), 0);
         this.server.createContext("/v1/threads", this::handleThreads);
+        this.traceReferenceSupplier = traceReferenceSupplier == null ? Optional::empty : traceReferenceSupplier;
         this.server.setExecutor(executor);
     }
 
@@ -104,11 +117,14 @@ public class RuntimeApiServer implements AutoCloseable {
             String result = runner.run(input);
             store.appendEvent(threadId, "message.delta",
                     "{\"turn_id\":\"" + turnId + "\",\"content\":\"" + escape(result) + "\"}");
+            PaiCliTracing.TraceReference traceReference = takeTraceReference();
             store.appendEvent(threadId, "turn.completed",
-                    "{\"turn_id\":\"" + turnId + "\",\"status\":\"completed\"}");
+                    "{\"turn_id\":\"" + turnId + "\",\"status\":\"completed\"" + traceFields(traceReference) + "}");
         } catch (Exception e) {
+            PaiCliTracing.TraceReference traceReference = takeTraceReference();
             store.appendEvent(threadId, "turn.failed",
-                    "{\"turn_id\":\"" + turnId + "\",\"error\":\"" + escape(e.getMessage()) + "\"}");
+                    "{\"turn_id\":\"" + turnId + "\",\"error\":\"" + escape(e.getMessage()) + "\""
+                            + traceFields(traceReference) + "}");
         }
     }
 
@@ -125,6 +141,23 @@ public class RuntimeApiServer implements AutoCloseable {
         try (OutputStream os = exchange.getResponseBody()) {
             os.write(body);
         }
+    }
+
+    private PaiCliTracing.TraceReference takeTraceReference() {
+        try {
+            Optional<PaiCliTracing.TraceReference> reference = traceReferenceSupplier.get();
+            return reference == null ? null : reference.orElse(null);
+        } catch (RuntimeException ignored) {
+            return null;
+        }
+    }
+
+    private static String traceFields(PaiCliTracing.TraceReference reference) {
+        if (reference == null) {
+            return "";
+        }
+        return ",\"trace_id\":\"" + escape(reference.traceId())
+                + "\",\"root_observation_id\":\"" + escape(reference.observationId()) + "\"";
     }
 
     private boolean authorized(HttpExchange exchange) {

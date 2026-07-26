@@ -1,5 +1,6 @@
 package com.paicli.runtime.api;
 
+import com.paicli.observability.PaiCliTracing;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -9,6 +10,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -17,7 +19,12 @@ class RuntimeApiServerTest {
     @Test
     void exposesThreadTurnAndSseEvents(@TempDir Path tempDir) throws Exception {
         try (RuntimeThreadStore store = new RuntimeThreadStore(tempDir.resolve("runtime.db"));
-             RuntimeApiServer server = new RuntimeApiServer(store, prompt -> "reply:" + prompt, 0, "secret")) {
+             RuntimeApiServer server = new RuntimeApiServer(
+                     store,
+                     prompt -> "reply:" + prompt,
+                     0,
+                     "secret",
+                     () -> Optional.of(new PaiCliTracing.TraceReference("trace-123", "span-456")))) {
             server.start();
             HttpClient client = HttpClient.newHttpClient();
             String base = "http://127.0.0.1:" + server.port();
@@ -38,6 +45,8 @@ class RuntimeApiServerTest {
             assertTrue(events.contains("event: message.delta"));
             assertTrue(events.contains("reply:hello"));
             assertTrue(events.contains("event: turn.completed"));
+            assertTrue(events.contains("\"trace_id\":\"trace-123\""));
+            assertTrue(events.contains("\"root_observation_id\":\"span-456\""));
         }
     }
 

@@ -12,6 +12,7 @@ import com.paicli.context.ContextProfile;
 import com.paicli.lsp.LspDiagnosticReport;
 import com.paicli.lsp.LspManager;
 import com.paicli.mcp.protocol.McpToolDescriptor;
+import com.paicli.observability.PaiCliTracing;
 import com.paicli.rag.CodeRetriever;
 import com.paicli.rag.SearchResultFormatter;
 import com.paicli.rag.VectorStore;
@@ -46,6 +47,7 @@ import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.*;
 import java.util.concurrent.*;
+import io.opentelemetry.context.Context;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -104,6 +106,7 @@ public class ToolRegistry {
     private boolean customSnapshotService;
     private volatile String currentProvider = "";
     private volatile String currentModel = "";
+    private PaiCliTracing tracing = PaiCliTracing.noop();
 
     public ToolRegistry() {
         this(DEFAULT_COMMAND_TIMEOUT_SECONDS, DEFAULT_TOOL_BATCH_TIMEOUT_SECONDS);
@@ -158,6 +161,10 @@ public class ToolRegistry {
         return contextProfile;
     }
 
+    public void setTracing(PaiCliTracing tracing) {
+        this.tracing = tracing == null ? PaiCliTracing.noop() : tracing;
+    }
+
     /**
      * 构造给只读检索子 Agent 用的工具视图：物理排除写 / 执行 / 项目 / 回滚工具与
      * {@code explore_codebase} 自身，只暴露 5 个只读检索工具。
@@ -185,6 +192,7 @@ public class ToolRegistry {
         view.setProjectPath(this.projectPath);        // 级联重建 pathGuard / lspManager；因上面置真,跳过快照重建
         view.setContextProfile(this.contextProfile);  // 压缩触发阈值与主 Agent 一致
 
+        view.setTracing(this.tracing);
         // —— 故意不复制 searchProvider ——
         // 白名单 5 个工具均不依赖它：search_code 走 new CodeRetriever(projectPath);
         // searchProvider 只支撑未在白名单内的 web_search,复制属冗余。
@@ -1258,10 +1266,7 @@ public class ToolRegistry {
                     .toList();
         }
         if (invocations.size() == 1) {
-            ToolInvocation invocation = invocations.get(0);
-            long startedAt = System.nanoTime();
-            ToolOutput output = executeToolOutput(invocation.name(), invocation.argumentsJson());
-            return List.of(ToolExecutionResult.completed(invocation, output, elapsedMillis(startedAt)));
+            return List.of(executeTracedInvocation(invocations.get(0)));
         }
 
         int parallelism = Math.min(invocations.size(), MAX_PARALLEL_TOOLS);
@@ -1272,15 +1277,10 @@ public class ToolRegistry {
         });
 
         try {
+            Context parentContext = Context.current();
             List<Callable<ToolExecutionResult>> tasks = invocations.stream()
-                    .<Callable<ToolExecutionResult>>map(invocation -> () -> {
-                        if (CancellationContext.isCancelled()) {
-                            return ToolExecutionResult.failed(invocation, "用户取消了此次工具调用");
-                        }
-                        long startedAt = System.nanoTime();
-                        ToolOutput output = executeToolOutput(invocation.name(), invocation.argumentsJson());
-                        return ToolExecutionResult.completed(invocation, output, elapsedMillis(startedAt));
-                    })
+                    .<Callable<ToolExecutionResult>>map(invocation -> parentContext.wrap(
+                            () -> executeTracedInvocation(invocation)))
                     .toList();
 
             List<Future<ToolExecutionResult>> futures =
@@ -1316,6 +1316,33 @@ public class ToolRegistry {
                     .toList();
         } finally {
             executor.shutdownNow();
+        }
+    }
+
+    private ToolExecutionResult executeTracedInvocation(ToolInvocation invocation) {
+        try (PaiCliTracing.ToolRun toolRun = tracing.startTool(
+                invocation.name(), invocation.id(), invocation.argumentsJson())) {
+            // catch 必须写在 try-with-resources 内部：写在外层时 span 已经 close，
+            // toolRun.error(...) 永远调不到，异常在 Trace 里会伪装成正常结束。
+            try {
+                if (CancellationContext.isCancelled()) {
+                    ToolExecutionResult failed = ToolExecutionResult.failed(invocation, "用户取消了此次工具调用");
+                    toolRun.output(failed.result());
+                    toolRun.cancelled("用户取消了此次工具调用");
+                    return failed;
+                }
+                long startedAt = System.nanoTime();
+                ToolOutput output = executeToolOutput(invocation.name(), invocation.argumentsJson());
+                ToolExecutionResult result = ToolExecutionResult.completed(invocation, output, elapsedMillis(startedAt));
+                toolRun.output(result.result());
+                return result;
+            } catch (RuntimeException e) {
+                ToolExecutionResult failed = ToolExecutionResult.failed(invocation,
+                        e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+                toolRun.output(failed.result());
+                toolRun.error(e);
+                return failed;
+            }
         }
     }
 
