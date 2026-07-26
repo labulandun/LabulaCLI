@@ -23,21 +23,15 @@ class GraderTest {
     Path workspace;
 
     private static GraderSpec spec(String type, String... kv) {
-        ObjectNode node = MAPPER.createObjectNode();
-        node.put("type", type);
-        for (int i = 0; i < kv.length; i += 2) {
-            node.put(kv[i], kv[i + 1]);
-        }
-        return new GraderSpec(type, node);
+        return EvalFixtures.graderSpec(type, kv);
     }
 
     private static RunArtifact artifact(String answer) {
-        return new RunArtifact("case-x", 1, "completed", answer, null, null, null, 1000, 0, 0, 0,
-                RunArtifact.LlmStats.EMPTY, List.of());
+        return EvalFixtures.artifact("case-x", "completed", answer);
     }
 
     private CaseSpec caseSpec() {
-        return new CaseSpec("case-x", "custom", "prompt", 600, 1, "host", workspace, null, List.of());
+        return EvalFixtures.caseSpec("case-x", "custom", workspace, null);
     }
 
     @Test

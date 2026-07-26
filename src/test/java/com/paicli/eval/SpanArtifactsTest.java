@@ -75,7 +75,7 @@ class SpanArtifactsTest {
                 spanLine("execute_command", "tool", "ERROR", "ERROR", 500, null));
         List<SpanLog.SpanRecord> spans = SpanLog.read(file);
         RunArtifact artifact = new RunArtifact("c1", 1, "completed", "", null, "t1", null,
-                5000, 0, 0, 0, SpanArtifacts.llmStats(spans), SpanArtifacts.toolStats(spans));
+                5000, 0, 0, 0, SpanArtifacts.llmStats(spans), SpanArtifacts.toolStats(spans), List.of());
 
         Map<String, Double> byName = new java.util.HashMap<>();
         for (Score score : SpanArtifacts.metricScores(artifact)) {
@@ -92,9 +92,7 @@ class SpanArtifactsTest {
     @Test
     void emptyOrMissingSpansProduceNoMetrics() throws Exception {
         assertTrue(SpanLog.read(tempDir.resolve("missing.jsonl")).isEmpty());
-        RunArtifact artifact = new RunArtifact("c1", 1, "completed", "", null, null, null,
-                5000, 0, 0, 0, RunArtifact.LlmStats.EMPTY, List.of());
-        assertTrue(SpanArtifacts.metricScores(artifact).isEmpty());
+        assertTrue(SpanArtifacts.metricScores(EvalFixtures.artifact("c1")).isEmpty());
     }
 
     @Test

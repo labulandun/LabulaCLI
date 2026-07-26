@@ -14,7 +14,7 @@
 - 定位：面向商业使用的 Java Agent CLI 产品，对标 Claude Code
 - 已交付 21 期（ReAct → Plan+DAG → Memory → RAG → Multi-Agent → HITL → 并行工具 → 多模型 → 联网 → MCP 核心 → MCP 高级 → 长上下文 → Chrome DevTools → CDP 会话复用 → Skill → TUI → LSP 诊断 → Side-Git 快照 → Prompt 分层 → Runtime API → 图片输入）
 - OpenTelemetry / Langfuse ReAct MVP 已接入：根 observation、generation、tool、并行上下文、Runtime trace ID 回传、退出 flush；Plan / Team / 独立 SubAgent 尚未覆盖
-- 评测体系 Phase E1+E2 已交付：`com.paicli.eval.EvalMain` 黑盒驱动 `serve --http` 子进程跑 `eval/suites/custom`（10 条）与 `eval/suites/tool-golden`（5 条）；`PAICLI_OTEL_TRACES_EXPORTER=file` 把 span 同步落盘为 spans.jsonl，artifact 聚合 llm/tool 明细并自动产出 tokens/rounds/tool_error_rate 指标分；总设计与 E3–E5 计划见 `docs/evaluation-system-design.md`
+- 评测体系 Phase E1–E3 已交付：`com.paicli.eval.EvalMain` 黑盒驱动 `serve --http` 子进程跑 `eval/suites/` 下 custom（10）/ tool-golden（5）/ safety（8）三个 suite；`PAICLI_OTEL_TRACES_EXPORTER=file` 把 span 同步落盘为 spans.jsonl，artifact 聚合 llm/tool/audit 明细并自动产出 tokens/rounds/tool_error_rate 指标分；`SandboxExecutor` 分 host / docker 两档，按爆炸半径而非 suite 选择，Docker 不可用时 docker 用例 skip 不降级；总设计与 E4–E5 计划见 `docs/evaluation-system-design.md`
 - 下一步：OAuth / sampling / recovery 作为后续 MCP 增强
 - Banner 版本：`v16.1.0`，Maven 产物：`paicli-1.0-SNAPSHOT.jar`（两者不一致是正常状态）
 
@@ -212,7 +212,9 @@ src/main/java/com/paicli/
 
 ## 当前已知边界
 
-以下在路线图但未交付：容器/VM 沙箱 / MCP OAuth + sampling + server 自动重启
+以下在路线图但未交付：产品运行时的容器/VM 沙箱 / MCP OAuth + sampling + server 自动重启
+
+Phase E3 的 Docker 沙盒**只用于评测 harness**（`com.paicli.eval.DockerExecutor`），不是产品运行时沙箱：日常 CLI 使用仍然是「HITL + 路径校验 + 命令快速拒绝 + 审计」，没有进程隔离。不要把两者混为一谈。`RuntimeApiServer` 的 `PAICLI_RUNTIME_API_HOST` 默认 `127.0.0.1`，只有容器场景才应放开。
 OpenTelemetry 当前业务埋点只覆盖 ReAct 主路径；Plan / Team / 独立 SubAgent 不能误报为已覆盖。Score 通过 Langfuse Scores API 写入，不作为 OTLP span 伪造。
 
 不要把 `ROADMAP.md` 中"将来要做"误读成"现在已有"。

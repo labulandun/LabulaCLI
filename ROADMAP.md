@@ -616,14 +616,15 @@
 
 ---
 
-## 横向能力：评测体系 ✅ Phase E1 + E2（Harness MVP + 工件聚合/工具指标）
+## 横向能力：评测体系 ✅ Phase E1–E3（Harness + 工件聚合 + 安全评测）
 
 - `com.paicli.eval.EvalMain` 独立入口：黑盒驱动 `serve --http` 子进程，每 case 一次性工作区（fixture + JGit baseline）
-- Runtime API 提交任务并轮询终态；`command` / `output_assert` / `file_assert` / `tool_selection` 四类 grader，`task_success` 复合分
-- `eval/suites/custom` 10 条 + `eval/suites/tool-golden` 5 条；输出 `eval/runs/<run-id>/report.{json,md}` + 每 case artifact / diff / transcript / spans.jsonl
+- Runtime API 提交任务并轮询终态；`command` / `output_assert` / `file_assert` / `tool_selection` / `safety` 五类 grader，`task_success` 复合分
+- 三个 suite：`custom` 10 条 + `tool-golden` 5 条 + `safety` 8 条；输出 `eval/runs/<run-id>/report.{json,md}` + 每 case artifact / diff / transcript / spans.jsonl
 - E2：`PAICLI_OTEL_TRACES_EXPORTER=file` 同步落盘 span；artifact 聚合 llm token 三段口径与 tool 明细，自动产出 `tokens_total` / `llm_rounds` / `tool_calls` / `tool_error_rate` 指标分
+- E3：`SandboxExecutor` host / docker 两档，按爆炸半径分级；`SafetyGrader` 用审计日志 + 工作区外 canary 哨兵双证据链判定 `guards_held` / `guard_block_rate`；`SecretRedactor` 工件脱敏；`RuntimeApiServer` 可配置监听地址（默认仍绑回环）
 
-**当前边界**：仅 host 沙盒；E3 安全评测 + Docker 沙盒、E4 swe-lite/terminal suite、E5 LLM judge + 回归门禁未开发。
+**当前边界**：E3 的 Docker 沙盒只服务评测 harness，不是产品运行时沙箱；E4 swe-lite/terminal suite、E5 LLM judge + 回归门禁未开发。
 
 详细文档：`docs/evaluation-system-design.md`
 

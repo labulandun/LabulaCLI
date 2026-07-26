@@ -12,19 +12,22 @@ import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 /**
- * 被测 PaiCLI 子进程：`java -jar paicli.jar serve --http --port N`，cwd 指向评测工作区。
- * Runtime 数据目录用 PAICLI_RUNTIME_DIR 重定向到本次运行目录，避免污染 ~/.paicli。
+ * 被测 PaiCLI 子进程的生命周期：按 {@link SandboxExecutor} 给出的命令启动，
+ * 等端口就绪，结束时停止并做沙盒清理。
  */
 public final class PaiCliProcess implements AutoCloseable {
 
-    private static final int READY_TIMEOUT_SECONDS = 60;
+    private static final int READY_TIMEOUT_SECONDS = 90;
 
     private final Process process;
     private final Path logFile;
+    private final SandboxExecutor sandbox;
+    private boolean stopped;
 
-    private PaiCliProcess(Process process, Path logFile) {
+    private PaiCliProcess(Process process, Path logFile, SandboxExecutor sandbox) {
         this.process = process;
         this.logFile = logFile;
+        this.sandbox = sandbox;
     }
 
     public static int freePort() throws IOException {
@@ -33,38 +36,31 @@ public final class PaiCliProcess implements AutoCloseable {
         }
     }
 
-    public static PaiCliProcess start(Path jar,
-                                      Path workspace,
-                                      Path runtimeDir,
-                                      Path logFile,
-                                      Path spansFile,
-                                      int port,
-                                      String apiKey,
-                                      Map<String, String> dotEnv) throws IOException {
-        Files.createDirectories(runtimeDir);
+    public static PaiCliProcess start(SandboxExecutor sandbox, LaunchSpec spec, Path logFile) throws IOException {
+        Files.createDirectories(spec.outDir());
+        Files.createDirectories(spec.runtimeDir());
+        Files.createDirectories(spec.auditDir());
         Files.createDirectories(logFile.getParent());
-        String javaBin = Path.of(System.getProperty("java.home"), "bin",
-                isWindows() ? "java.exe" : "java").toString();
-        ProcessBuilder builder = new ProcessBuilder(List.of(
-                javaBin, "-jar", jar.toAbsolutePath().toString(),
-                "serve", "--http", "--port", String.valueOf(port)));
-        builder.directory(workspace.toFile());
+
+        SandboxExecutor.Launch launch = sandbox.prepare(spec);
+        ProcessBuilder builder = new ProcessBuilder(launch.command());
+        builder.directory(spec.workspace().toFile());
         // .env 条目只补缺不覆盖：用户在真实环境显式 export 的值优先
-        for (Map.Entry<String, String> entry : dotEnv.entrySet()) {
+        for (Map.Entry<String, String> entry : spec.dotEnv().entrySet()) {
             builder.environment().putIfAbsent(entry.getKey(), entry.getValue());
         }
-        builder.environment().put("PAICLI_RUNTIME_API_KEY", apiKey);
-        builder.environment().put("PAICLI_RUNTIME_DIR", runtimeDir.toAbsolutePath().toString());
-        // 评测强制 file exporter（覆盖 .env 的 OTLP 配置）：span 同步落盘供工件聚合，
-        // 评测流量不进 Langfuse
-        builder.environment().put("PAICLI_OTEL_ENABLED", "true");
-        builder.environment().put("PAICLI_OTEL_TRACES_EXPORTER", "file");
-        builder.environment().put("PAICLI_OTEL_TRACES_FILE", spansFile.toAbsolutePath().toString());
+        builder.environment().putAll(launch.env());
         builder.redirectErrorStream(true);
         builder.redirectOutput(ProcessBuilder.Redirect.appendTo(logFile.toFile()));
+
         Process process = builder.start();
-        PaiCliProcess handle = new PaiCliProcess(process, logFile);
-        handle.waitUntilReady(port);
+        PaiCliProcess handle = new PaiCliProcess(process, logFile, sandbox);
+        try {
+            handle.waitUntilReady(spec.port());
+        } catch (IOException e) {
+            handle.stop();
+            throw e;
+        }
         return handle;
     }
 
@@ -72,7 +68,8 @@ public final class PaiCliProcess implements AutoCloseable {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(READY_TIMEOUT_SECONDS);
         while (System.nanoTime() < deadline) {
             if (!process.isAlive()) {
-                throw new IOException("PaiCLI 子进程启动即退出 (exit=" + process.exitValue() + ")\n" + logTail());
+                throw new IOException("被测进程启动即退出 (sandbox=" + sandbox.name()
+                        + ", exit=" + process.exitValue() + ")\n" + logTail());
             }
             try (Socket socket = new Socket()) {
                 socket.connect(new InetSocketAddress("127.0.0.1", port), 500);
@@ -81,8 +78,8 @@ public final class PaiCliProcess implements AutoCloseable {
                 sleep(500);
             }
         }
-        stop();
-        throw new IOException("PaiCLI 子进程 " + READY_TIMEOUT_SECONDS + "s 内未监听端口 " + port + "\n" + logTail());
+        throw new IOException("被测进程 " + READY_TIMEOUT_SECONDS + "s 内未监听端口 " + port
+                + " (sandbox=" + sandbox.name() + ")\n" + logTail());
     }
 
     public String logTail() {
@@ -96,6 +93,10 @@ public final class PaiCliProcess implements AutoCloseable {
     }
 
     public void stop() {
+        if (stopped) {
+            return;
+        }
+        stopped = true;
         process.destroy();
         try {
             if (!process.waitFor(10, TimeUnit.SECONDS)) {
@@ -105,6 +106,8 @@ public final class PaiCliProcess implements AutoCloseable {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             process.destroyForcibly();
+        } finally {
+            sandbox.cleanup();
         }
     }
 
@@ -114,10 +117,6 @@ public final class PaiCliProcess implements AutoCloseable {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
-    }
-
-    private static boolean isWindows() {
-        return System.getProperty("os.name", "").toLowerCase().contains("win");
     }
 
     @Override

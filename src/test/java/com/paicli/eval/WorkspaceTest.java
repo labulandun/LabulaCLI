@@ -17,8 +17,7 @@ class WorkspaceTest {
     Path tempDir;
 
     private CaseSpec specWithFixture(Path fixtureDir) {
-        return new CaseSpec("ws-case", "custom", "prompt", 600, 1, "host",
-                fixtureDir.getParent(), fixtureDir, List.of());
+        return EvalFixtures.caseSpec("ws-case", "custom", fixtureDir.getParent(), fixtureDir);
     }
 
     @Test
@@ -51,8 +50,7 @@ class WorkspaceTest {
 
     @Test
     void emptyFixtureProducesEmptyBaselineAndDiff() throws Exception {
-        CaseSpec spec = new CaseSpec("empty-case", "custom", "prompt", 600, 1, "host",
-                tempDir, null, List.of());
+        CaseSpec spec = EvalFixtures.caseSpec("empty-case", "custom", tempDir, null);
         Workspace workspace = Workspace.provision(spec, tempDir.resolve("ws-empty"));
         try {
             Workspace.DiffStats before = workspace.diff();

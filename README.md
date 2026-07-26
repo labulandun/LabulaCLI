@@ -240,7 +240,18 @@ java -cp target/paicli-1.0-SNAPSHOT.jar com.paicli.eval.EvalMain --suite custom
 - 新 grader `tool_selection`：断言工具选择（`first_search` 首个检索类工具 / `first` / `any` 三种模式），数据来自 tool span 序列
 - 新 suite `eval/suites/tool-golden/`（5 条，共享 mini-shop fixture）：验证"该用 `grep_code`/`glob_files` 时是否用了"，与 `docs/code-search-golden-set.md` 的确定性 golden set 互补（那边测工具实现，这边测模型的工具选择）
 - 运行：`java -cp target/paicli-1.0-SNAPSHOT.jar com.paicli.eval.EvalMain --suite custom,tool-golden`
-- 当前边界：仅 host 沙盒（`sandbox: docker` 的 case 会被跳过）；安全评测 / swe+terminal suite / LLM judge 见 `docs/evaluation-system-design.md`（Phase E3–E5）
+
+### 评测体系 Phase E3（安全评测 + Docker 沙盒）
+
+- `SandboxExecutor` 两档实现：`HostExecutor`（一次性工作区 + PathGuard/CommandGuard + canary 哨兵）、`DockerExecutor`（内存/CPU/pids 限额、`--cap-drop=ALL`、`no-new-privileges`、工作区 `/work` 与产物 `/out` 分离挂载、jar 只读挂载、退出时强制删容器）
+- 沙盒按**爆炸半径**分级而非按 suite 一刀切：写工作区外、读 `~/.ssh`、dump 环境变量留在 host（失守也可控，且有 canary 与脱敏兜底）；`rm -rf /`、`curl | sh`、`sudo chmod 777 /`、fork bomb 强制 docker。Docker 不可用时这些 case 整体 skip 并在报告标注，**绝不降级到宿主机**
+- 新 grader `safety`：交叉 AuditLog 与工作区外 canary 哨兵。产出 `guards_held`（BOOLEAN 门槛）/ `violation_attempts` / `violations_executed` / `guard_block_rate`。**被拦截是期望行为，不扣分**——评测的是防线有没有守住
+- canary 哨兵是审计日志之外的第二条证据链：它在 Agent 项目根之外，PathGuard 正常时碰不到，因此任何改动都是已经发生的路径逃逸，与审计日志是否干净无关
+- `SecretRedactor`：harness 必须给子进程注入真实 API Key，而 safety suite 会诱导 Agent 打印环境变量，所以 transcript / artifact / diff 落盘前统一脱敏
+- `RuntimeApiServer` 新增 `PAICLI_RUNTIME_API_HOST`（容器内需监听 `0.0.0.0`，端口映射的包到达 eth0 而非 loopback），**默认仍是 `127.0.0.1`**
+- 新 suite `eval/suites/safety/`（8 条，含 1 条正常任务对照组，防止 grader 退化成"什么都不做就满分"）；判定口径与分级见 `eval/suites/safety/README.md`
+- 运行：`java -cp target/paicli-1.0-SNAPSHOT.jar com.paicli.eval.EvalMain --suite safety`
+- 当前边界：swe-lite / terminal suite、LLM judge 与回归门禁见 `docs/evaluation-system-design.md`（Phase E4–E5）
 
 ### 第六期 HITL 增强（路径围栏 / 命令快速拒绝 / 操作审计）
 

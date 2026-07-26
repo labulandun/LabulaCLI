@@ -76,6 +76,17 @@ public final class Reporter {
             node.put("tokens_total", result.artifact().llm().totalTokens());
             node.put("tool_calls", result.artifact().tools().size());
             node.put("tool_errors", result.artifact().toolErrors());
+            if (!result.artifact().audit().isEmpty()) {
+                ArrayNode audit = node.putArray("audit");
+                for (AuditTrail.AuditRecord record : result.artifact().audit()) {
+                    ObjectNode auditNode = audit.addObject();
+                    auditNode.put("tool", record.tool());
+                    auditNode.put("outcome", record.outcome());
+                    auditNode.put("approver", record.approver());
+                    auditNode.put("args", record.args());
+                    auditNode.put("reason", record.reason());
+                }
+            }
             if (result.artifact().traceId() != null) {
                 node.put("trace_id", result.artifact().traceId());
             }
@@ -123,6 +134,8 @@ public final class Reporter {
                     result.artifact().deletions(),
                     scoreSummary(result)));
         }
+        appendSafetySection(md, executed);
+
         List<CaseResult> failed = executed.stream().filter(r -> !r.taskSuccess()).toList();
         if (!failed.isEmpty()) {
             md.append("\n## 失败明细\n");
@@ -140,6 +153,45 @@ public final class Reporter {
             }
         }
         return md.toString();
+    }
+
+    /**
+     * 安全小节单独成段：guards_held 是 P0 门槛，任何一条未守住都要在报告里一眼看到，
+     * 不能只混在 pass_rate 里。
+     */
+    private static void appendSafetySection(StringBuilder md, List<CaseResult> executed) {
+        List<CaseResult> safetyCases = executed.stream()
+                .filter(r -> r.scores().stream().anyMatch(s -> "guards_held".equals(s.name())))
+                .toList();
+        if (safetyCases.isEmpty()) {
+            return;
+        }
+        long held = safetyCases.stream()
+                .filter(r -> r.scores().stream().anyMatch(s -> "guards_held".equals(s.name()) && s.passed()))
+                .count();
+        md.append("\n## 安全评测\n\n");
+        md.append(String.format("**guards_held: %d/%d**", held, safetyCases.size()));
+        if (held < safetyCases.size()) {
+            md.append("  ⚠️ 存在未拦截的危险动作，按 P0 处理");
+        }
+        md.append("\n\n| case | guards_held | attempts | executed | block_rate |\n");
+        md.append("|------|-------------|----------|----------|------------|\n");
+        for (CaseResult result : safetyCases) {
+            md.append(String.format("| %s | %s | %.0f | %.0f | %.2f |\n",
+                    result.caseId(),
+                    scoreValue(result, "guards_held") >= 1.0 ? "✅" : "❌",
+                    scoreValue(result, "violation_attempts"),
+                    scoreValue(result, "violations_executed"),
+                    scoreValue(result, "guard_block_rate")));
+        }
+    }
+
+    private static double scoreValue(CaseResult result, String name) {
+        return result.scores().stream()
+                .filter(s -> name.equals(s.name()))
+                .mapToDouble(Score::value)
+                .findFirst()
+                .orElse(0.0);
     }
 
     /** md 表格只列 BOOLEAN 断言分；NUMERIC 指标已有独立列（report.json 里两者都全）。 */

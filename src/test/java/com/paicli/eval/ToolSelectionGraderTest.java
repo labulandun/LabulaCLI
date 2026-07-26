@@ -30,15 +30,11 @@ class ToolSelectionGraderTest {
     }
 
     private static RunArtifact artifactWithTools(String... toolNames) {
-        List<RunArtifact.ToolCallStat> tools = java.util.Arrays.stream(toolNames)
-                .map(name -> new RunArtifact.ToolCallStat(name, "OK", 100))
-                .toList();
-        return new RunArtifact("c1", 1, "completed", "", null, null, null, 1000, 0, 0, 0,
-                RunArtifact.LlmStats.EMPTY, tools);
+        return EvalFixtures.artifactWithTools(toolNames);
     }
 
     private static CaseSpec caseSpec() {
-        return new CaseSpec("c1", "tool-golden", "prompt", 300, 1, "host", Path.of("."), null, List.of());
+        return EvalFixtures.caseSpec("c1", "tool-golden", Path.of("."), null);
     }
 
     @Test

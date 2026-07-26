@@ -24,8 +24,7 @@ public record CaseResult(String caseId,
     }
 
     public static CaseResult skipped(CaseSpec spec, String reason) {
-        RunArtifact artifact = new RunArtifact(spec.id(), 1, "skipped", "", reason, null, null, 0, 0, 0, 0,
-                RunArtifact.LlmStats.EMPTY, List.of());
+        RunArtifact artifact = RunArtifact.failure(spec.id(), 1, "skipped", reason, 0);
         return new CaseResult(spec.id(), spec.suite(), 1, artifact, List.of(), false, reason);
     }
 

@@ -45,7 +45,7 @@ public class RuntimeApiServer implements AutoCloseable {
         this.store = store;
         this.runner = runner;
         this.apiKey = apiKey;
-        this.server = HttpServer.create(new InetSocketAddress("127.0.0.1", port), 0);
+        this.server = HttpServer.create(new InetSocketAddress(configuredBindHost(), port), 0);
         this.server.createContext("/v1/threads", this::handleThreads);
         this.traceReferenceSupplier = traceReferenceSupplier == null ? Optional::empty : traceReferenceSupplier;
         this.server.setExecutor(executor);
@@ -57,6 +57,21 @@ public class RuntimeApiServer implements AutoCloseable {
             configured = System.getenv("PAICLI_RUNTIME_API_KEY");
         }
         return configured;
+    }
+
+    /**
+     * 监听地址，默认 127.0.0.1，只有显式配置才放开。
+     *
+     * <p>放开的唯一预期场景是容器内运行：端口映射的数据包到达容器 eth0 而不是 loopback，
+     * 绑定 127.0.0.1 会导致宿主机无法访问。在宿主机上配置这个变量等于把 Agent 运行时
+     * 暴露到网络，只有 API Key 一道防线，不要这么做。</p>
+     */
+    static String configuredBindHost() {
+        String configured = System.getProperty("paicli.runtime.api.host");
+        if (configured == null || configured.isBlank()) {
+            configured = System.getenv("PAICLI_RUNTIME_API_HOST");
+        }
+        return configured == null || configured.isBlank() ? "127.0.0.1" : configured.trim();
     }
 
     public void start() {

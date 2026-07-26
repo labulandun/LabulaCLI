@@ -99,4 +99,17 @@ class RuntimeApiServerTest {
         int end = body.indexOf('"', start);
         return body.substring(start, end);
     }
+
+    /** 默认必须绑回环：放开监听地址等于把 Agent 运行时暴露到网络，只能由容器场景显式开启。 */
+    @Test
+    void bindHostDefaultsToLoopbackAndOnlyOpensWhenConfigured() {
+        assertEquals("127.0.0.1", RuntimeApiServer.configuredBindHost());
+        System.setProperty("paicli.runtime.api.host", "0.0.0.0");
+        try {
+            assertEquals("0.0.0.0", RuntimeApiServer.configuredBindHost());
+        } finally {
+            System.clearProperty("paicli.runtime.api.host");
+        }
+        assertEquals("127.0.0.1", RuntimeApiServer.configuredBindHost());
+    }
 }

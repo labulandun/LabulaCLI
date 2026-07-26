@@ -15,7 +15,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class ReporterTest {
 
     private static CaseSpec spec(String id) {
-        return new CaseSpec(id, "custom", "prompt", 600, 1, "host", Path.of("."), null, List.of());
+        return EvalFixtures.caseSpec(id);
     }
 
     private static CaseResult passed(String id) {
@@ -23,14 +23,15 @@ class ReporterTest {
                 4000, 1, 5, 2,
                 new RunArtifact.LlmStats(3, 900, 100, 200, 1200),
                 List.of(new RunArtifact.ToolCallStat("grep_code", "OK", 100),
-                        new RunArtifact.ToolCallStat("execute_command", "ERROR", 300)));
+                        new RunArtifact.ToolCallStat("execute_command", "ERROR", 300)),
+                List.of(new AuditTrail.AuditRecord("execute_command", "rm -rf /", "deny",
+                        "禁止 rm -rf 删除全盘或用户目录", "policy")));
         return CaseResult.of(spec(id), 1, artifact,
                 List.of(Score.bool("tests_pass", true, "ok")));
     }
 
     private static CaseResult failed(String id) {
-        RunArtifact artifact = new RunArtifact(id, 1, "completed", "no", null, null, null,
-                8000, 0, 0, 0, RunArtifact.LlmStats.EMPTY, List.of());
+        RunArtifact artifact = EvalFixtures.artifact(id, "completed", "no");
         return CaseResult.of(spec(id), 1, artifact,
                 List.of(Score.bool("tests_pass", false, "exit=1 cmd=java Check\nFAIL detail")));
     }
@@ -60,13 +61,11 @@ class ReporterTest {
 
     @Test
     void turnFailureOrEmptyScoresNeverCountAsSuccess() {
-        RunArtifact failedTurn = new RunArtifact("c1", 1, "failed", "", "boom", null, null, 100, 0, 0, 0,
-                RunArtifact.LlmStats.EMPTY, List.of());
+        RunArtifact failedTurn = EvalFixtures.artifact("c1", "failed", "");
         assertFalse(CaseResult.of(spec("c1"), 1, failedTurn,
                 List.of(Score.bool("tests_pass", true, "ok"))).taskSuccess());
 
-        RunArtifact completed = new RunArtifact("c2", 1, "completed", "ok", null, null, null, 100, 0, 0, 0,
-                RunArtifact.LlmStats.EMPTY, List.of());
+        RunArtifact completed = EvalFixtures.artifact("c2", "completed", "ok");
         assertFalse(CaseResult.of(spec("c2"), 1, completed, List.of()).taskSuccess());
     }
 

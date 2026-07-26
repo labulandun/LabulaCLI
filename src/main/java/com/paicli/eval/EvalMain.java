@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.lib.ObjectId;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -62,6 +63,7 @@ public final class EvalMain {
         Integer timeoutOverride = options.containsKey("timeout")
                 ? Integer.parseInt(options.get("timeout")) : null;
         Map<String, String> dotEnv = DotEnv.read(projectRoot.resolve(".env"));
+        SecretRedactor redactor = new SecretRedactor(dotEnv);
 
         Map<String, String> runMeta = new LinkedHashMap<>();
         runMeta.put("run_id", runId);
@@ -72,15 +74,25 @@ public final class EvalMain {
         writeJson(runDir.resolve("run-meta.json"), toObjectNode(runMeta));
 
         System.out.println("🧪 PaiCLI Eval run " + runId + "：共 " + cases.size() + " 条用例");
+        // docker 只探测一次；不可用时 docker 用例整体 skip，绝不降级到宿主机执行
+        DockerExecutor.Availability docker = cases.stream().anyMatch(c -> "docker".equals(c.sandbox()))
+                ? DockerExecutor.probe()
+                : new DockerExecutor.Availability(false, "无 docker 用例，未探测");
+        if (cases.stream().anyMatch(c -> "docker".equals(c.sandbox()))) {
+            System.out.println((docker.available() ? "🐳 " : "⚠️ ") + "Docker: " + docker.detail());
+        }
+
         List<CaseResult> results = new ArrayList<>();
         for (CaseSpec spec : cases) {
-            if (!"host".equals(spec.sandbox())) {
-                System.out.println("⏭ " + spec.id() + "：sandbox=" + spec.sandbox() + " E1 未支持，跳过");
-                results.add(CaseResult.skipped(spec, "sandbox " + spec.sandbox() + " 未支持（Phase E3 交付）"));
+            String skipReason = sandboxSkipReason(spec, docker);
+            if (skipReason != null) {
+                System.out.println("⏭ " + spec.id() + "：" + skipReason);
+                results.add(CaseResult.skipped(spec, skipReason));
                 continue;
             }
             for (int runIndex = 1; runIndex <= spec.runs(); runIndex++) {
-                CaseResult result = runCase(spec, runIndex, timeoutOverride, jar, runDir, dotEnv, keepWorkspace);
+                CaseResult result = runCase(spec, runIndex, timeoutOverride, jar, runDir, dotEnv,
+                        redactor, keepWorkspace);
                 results.add(result);
                 System.out.println((result.taskSuccess() ? "✅ " : "❌ ") + spec.id()
                         + " run-" + runIndex + " (" + result.artifact().status()
@@ -101,6 +113,7 @@ public final class EvalMain {
                                       Path jar,
                                       Path runDir,
                                       Map<String, String> dotEnv,
+                                      SecretRedactor redactor,
                                       boolean keepWorkspace) {
         Path caseRunDir = runDir.resolve("cases").resolve(spec.id()).resolve("run-" + runIndex);
         Workspace workspace = null;
@@ -108,18 +121,29 @@ public final class EvalMain {
         long startNanos = System.nanoTime();
         try {
             workspace = Workspace.provision(spec, caseRunDir.resolve("workspace"));
+            plantCanary(caseRunDir.resolve("canary"));
             int port = PaiCliProcess.freePort();
             String apiKey = "eval-" + UUID.randomUUID();
-            Path spansFile = caseRunDir.resolve("spans.jsonl");
-            process = PaiCliProcess.start(jar, workspace.root(), caseRunDir.resolve("runtime"),
-                    caseRunDir.resolve("paicli.log"), spansFile, port, apiKey, dotEnv);
+            Path outDir = caseRunDir.resolve("out");
+            Path spansFile = outDir.resolve("spans.jsonl");
+            Path auditDir = outDir.resolve("audit");
+            LaunchSpec launchSpec = new LaunchSpec(jar, workspace.root(), outDir, spansFile,
+                    outDir.resolve("runtime"), auditDir, port, apiKey, dotEnv);
+            SandboxExecutor sandbox = "docker".equals(spec.sandbox())
+                    ? new DockerExecutor(spec.dockerImage())
+                    : new HostExecutor();
+            process = PaiCliProcess.start(sandbox, launchSpec, caseRunDir.resolve("paicli.log"));
 
             RuntimeApiClient client = new RuntimeApiClient(port, apiKey);
             String threadId = client.createThread();
             client.submitTurn(threadId, spec.prompt());
             int timeoutSeconds = timeoutOverride != null ? timeoutOverride : spec.timeoutSeconds();
-            RuntimeApiClient.TurnOutcome outcome =
+            RuntimeApiClient.TurnOutcome raw =
                     client.awaitTerminal(threadId, Duration.ofSeconds(timeoutSeconds));
+            // 密钥必须在进入任何工件之前抹掉：safety suite 会诱导 Agent 打印环境变量
+            RuntimeApiClient.TurnOutcome outcome = new RuntimeApiClient.TurnOutcome(
+                    raw.status(), redactor.redact(raw.finalAnswer()), redactor.redact(raw.error()),
+                    raw.traceId(), raw.rootObservationId());
             process.stop();
             long wallTimeMs = (System.nanoTime() - startNanos) / 1_000_000;
 
@@ -129,14 +153,16 @@ public final class EvalMain {
             RunArtifact artifact = new RunArtifact(spec.id(), runIndex, outcome.status(),
                     outcome.finalAnswer(), outcome.error(), traceId, outcome.rootObservationId(),
                     wallTimeMs, diff.filesChanged(), diff.insertions(), diff.deletions(),
-                    SpanArtifacts.llmStats(spans), SpanArtifacts.toolStats(spans));
+                    SpanArtifacts.llmStats(spans), SpanArtifacts.toolStats(spans),
+                    redactAudit(AuditTrail.read(auditDir), redactor));
 
             Files.writeString(caseRunDir.resolve("transcript.txt"),
                     "prompt:\n" + spec.prompt() + "\n\nstatus: " + outcome.status()
                             + (outcome.error() == null ? "" : "\nerror: " + outcome.error())
                             + "\n\nfinal answer:\n" + outcome.finalAnswer() + "\n",
                     StandardCharsets.UTF_8);
-            Files.writeString(caseRunDir.resolve("workspace.diff"), diff.patch(), StandardCharsets.UTF_8);
+            Files.writeString(caseRunDir.resolve("workspace.diff"),
+                    redactor.redact(diff.patch()), StandardCharsets.UTF_8);
 
             List<Score> scores = gradeAll(spec, artifact, workspace.root());
             scores.addAll(SpanArtifacts.metricScores(artifact));
@@ -145,9 +171,7 @@ public final class EvalMain {
             return result;
         } catch (Exception e) {
             long wallTimeMs = (System.nanoTime() - startNanos) / 1_000_000;
-            RunArtifact artifact = new RunArtifact(spec.id(), runIndex, "error", "",
-                    describe(e), null, null, wallTimeMs, 0, 0, 0,
-                    RunArtifact.LlmStats.EMPTY, List.of());
+            RunArtifact artifact = RunArtifact.failure(spec.id(), runIndex, "error", describe(e), wallTimeMs);
             CaseResult result = new CaseResult(spec.id(), spec.suite(), runIndex, artifact,
                     List.of(), false, null);
             try {
@@ -168,6 +192,33 @@ public final class EvalMain {
                 }
             }
         }
+    }
+
+    private static List<AuditTrail.AuditRecord> redactAudit(List<AuditTrail.AuditRecord> records,
+                                                            SecretRedactor redactor) {
+        return records.stream()
+                .map(r -> new AuditTrail.AuditRecord(r.tool(), redactor.redact(r.args()),
+                        r.outcome(), redactor.redact(r.reason()), r.approver()))
+                .toList();
+    }
+
+    /**
+     * 在工作区之外放一个哨兵文件。PathGuard 正常工作时 Agent 碰不到它，
+     * SafetyGrader 用它证明是否发生过路径逃逸。
+     */
+    private static void plantCanary(Path canaryDir) throws IOException {
+        Files.createDirectories(canaryDir);
+        Files.writeString(canaryDir.resolve(SafetyGrader.CANARY_FILE),
+                SafetyGrader.CANARY_CONTENT, StandardCharsets.UTF_8);
+    }
+
+    /** 返回 null 表示可以执行；否则是 skip 原因。 */
+    private static String sandboxSkipReason(CaseSpec spec, DockerExecutor.Availability docker) {
+        return switch (spec.sandbox()) {
+            case "host" -> null;
+            case "docker" -> docker.available() ? null : "需要 Docker 沙盒但不可用：" + docker.detail();
+            default -> "未知 sandbox: " + spec.sandbox();
+        };
     }
 
     /** 单个 grader 抛异常不拖垮整条 case：记 0 分并把原因写进 comment。 */
@@ -251,7 +302,7 @@ public final class EvalMain {
                   --eval-home <dir>    eval 根目录（默认 eval）
                   --out <dir>          输出目录（默认 eval/runs）
                   --timeout <seconds>  覆盖所有 case 的超时
-                  --keep-workspace     保留工作区现场用于排查
+                  --keep-workspace     保留工作区现场用于排查（safety 用例排查时建议开）
                   --help               显示本帮助
                 """);
     }
