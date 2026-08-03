@@ -56,7 +56,7 @@ public final class PaiCliProcess implements AutoCloseable {
         Process process = builder.start();
         PaiCliProcess handle = new PaiCliProcess(process, logFile, sandbox);
         try {
-            handle.waitUntilReady(spec.port());
+            handle.waitUntilReady(spec.port(), spec.apiKey());
         } catch (IOException e) {
             handle.stop();
             throw e;
@@ -64,22 +64,40 @@ public final class PaiCliProcess implements AutoCloseable {
         return handle;
     }
 
-    private void waitUntilReady(int port) throws IOException {
+    private void waitUntilReady(int port, String apiKey) throws IOException {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(READY_TIMEOUT_SECONDS);
         while (System.nanoTime() < deadline) {
             if (!process.isAlive()) {
                 throw new IOException("被测进程启动即退出 (sandbox=" + sandbox.name()
                         + ", exit=" + process.exitValue() + ")\n" + logTail());
             }
-            try (Socket socket = new Socket()) {
-                socket.connect(new InetSocketAddress("127.0.0.1", port), 500);
+            if (runtimeApiResponds(port, apiKey)) {
                 return;
-            } catch (IOException ignored) {
-                sleep(500);
             }
+            sleep(500);
         }
         throw new IOException("被测进程 " + READY_TIMEOUT_SECONDS + "s 内未监听端口 " + port
                 + " (sandbox=" + sandbox.name() + ")\n" + logTail());
+    }
+
+    /**
+     * Docker 会在容器内服务启动前先开放宿主端口，因此仅 TCP connect 成功不足以判定就绪。
+     * 发送一个无副作用的 HTTP 请求并至少读到响应首字节，才说明 Runtime API 已开始处理请求。
+     */
+    static boolean runtimeApiResponds(int port, String apiKey) {
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress("127.0.0.1", port), 500);
+            socket.setSoTimeout(1_000);
+            String request = "GET /v1/threads HTTP/1.1\r\n"
+                    + "Host: 127.0.0.1\r\n"
+                    + "Authorization: Bearer " + apiKey + "\r\n"
+                    + "Connection: close\r\n\r\n";
+            socket.getOutputStream().write(request.getBytes(StandardCharsets.US_ASCII));
+            socket.getOutputStream().flush();
+            return socket.getInputStream().read() >= 0;
+        } catch (IOException ignored) {
+            return false;
+        }
     }
 
     public String logTail() {

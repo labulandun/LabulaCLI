@@ -92,9 +92,20 @@ public record CaseSpec(String id,
         if (repo.isBlank()) {
             throw new IllegalArgumentException("workspace.git 缺少 repo: " + id);
         }
+        String commit = gitNode.path("commit").asText("").strip();
+        if (commit.isBlank()) {
+            throw new IllegalArgumentException("workspace.git 必须固定 commit: " + id);
+        }
         // 相对路径按 case 目录解析，便于把 mini-repo 放在 suite 里
-        Path localRepo = caseDir.resolve(repo).normalize();
-        String resolved = Files.isDirectory(localRepo) ? localRepo.toString() : repo;
-        return new GitSource(resolved, gitNode.path("commit").asText(null));
+        String resolved = repo;
+        try {
+            Path localRepo = caseDir.resolve(repo).normalize();
+            if (Files.isDirectory(localRepo)) {
+                resolved = localRepo.toString();
+            }
+        } catch (java.nio.file.InvalidPathException ignored) {
+            // A remote URI may not be a valid local path on this platform.
+        }
+        return new GitSource(resolved, commit);
     }
 }

@@ -191,10 +191,19 @@ public class Agent {
      * 运行 Agent 循环
      */
     public String run(String userInput) {
+        return run(userInput, false);
+    }
+
+    /** Runtime API/后台任务需要拿到语义结果；流式内容已经渲染时也不能返回空串。 */
+    public String runForResult(String userInput) {
+        return run(userInput, true);
+    }
+
+    private String run(String userInput, boolean returnStreamedContent) {
         try (PaiCliTracing.AgentRun traceRun = tracing.startAgentRun(
                 userInput, llmClient.getProviderName(), llmClient.getModelName(), traceSessionId)) {
             try {
-                String result = runTraced(userInput, traceRun);
+                String result = runTraced(userInput, traceRun, returnStreamedContent);
                 if (result != null && !result.isBlank()) {
                     traceRun.outputIfAbsent(result);
                 }
@@ -206,7 +215,8 @@ public class Agent {
         }
     }
 
-    private String runTraced(String userInput, PaiCliTracing.AgentRun traceRun) {
+    private String runTraced(String userInput, PaiCliTracing.AgentRun traceRun,
+                             boolean returnStreamedContent) {
         log.info("ReAct run started: inputLength={}", userInput == null ? 0 : userInput.length());
         pruneHistoricalImagePayloads();
         // 存入短期记忆
@@ -333,7 +343,7 @@ public class Agent {
                 if (streamRenderer.hasStreamedOutput()) {
                     traceRun.output(response.content());
                     streamRenderer.finish();
-                    return "";
+                    return returnStreamedContent && response.content() != null ? response.content() : "";
                 }
                 streamRenderer.clearThinkingPanel();
                 String finalResponse = formatUserFacingResponse(reasoningTranscript.toString(), response.content());

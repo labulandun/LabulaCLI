@@ -55,6 +55,9 @@ java -jar target/paicli-1.0-SNAPSHOT.jar serve --http --port 8080
 - `turn.completed`
 - `turn.failed`
 
+Runtime API 与后台任务走 `Agent.runForResult(...)`：即使 provider 已把最终内容流式写给 renderer，
+仍会把语义回答写入 `message.delta`；交互 CLI 继续使用 `Agent.run(...)`，不会重复打印流式正文。
+
 ## 当前边界
 
 - Runtime API MVP 是事件回放式 SSE，不做长连接持续阻塞推送

@@ -8,6 +8,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * 验收命令的执行环境。
@@ -60,14 +61,18 @@ public interface CommandRunner {
         @Override
         public Result run(Path workspace, String command, int timeoutSeconds)
                 throws IOException, InterruptedException {
-            List<String> argv = new ArrayList<>(List.of(
+            return execute(new ProcessBuilder(command(workspace, command)), timeoutSeconds);
+        }
+
+        List<String> command(Path workspace, String command) {
+            return new ArrayList<>(List.of(
                     "docker", "run", "--rm",
                     "--memory=2g", "--cpus=2", "--pids-limit=256",
+                    "--cap-drop=ALL", "--security-opt", "no-new-privileges",
                     "-v", DockerExecutor.mount(workspace) + ":" + DockerExecutor.WORK_DIR,
                     "-w", DockerExecutor.WORK_DIR,
                     image,
                     "sh", "-lc", command));
-            return execute(new ProcessBuilder(argv), timeoutSeconds);
         }
 
         @Override
@@ -78,19 +83,94 @@ public interface CommandRunner {
 
     private static Result execute(ProcessBuilder builder, int timeoutSeconds)
             throws IOException, InterruptedException {
+        if (timeoutSeconds < 1) {
+            throw new IllegalArgumentException("timeoutSeconds 必须大于 0");
+        }
         builder.redirectErrorStream(true);
         Process process = builder.start();
-        String output;
-        try (InputStream stream = process.getInputStream()) {
-            ByteArrayOutputStream buffer = new ByteArrayOutputStream();
-            stream.transferTo(buffer);
-            output = buffer.toString(Charset.defaultCharset());
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        AtomicReference<IOException> outputFailure = new AtomicReference<>();
+        Thread outputDrainer = new Thread(() -> {
+            try (InputStream stream = process.getInputStream()) {
+                stream.transferTo(buffer);
+            } catch (IOException e) {
+                outputFailure.set(e);
+            }
+        }, "paicli-command-output-" + process.pid());
+        outputDrainer.setDaemon(true);
+        outputDrainer.start();
+
+        boolean finished;
+        try {
+            finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS);
+            if (!finished) {
+                stopProcessTree(process);
+            }
+            awaitOutput(outputDrainer, process);
+        } catch (InterruptedException e) {
+            stopProcessTree(process);
+            Thread.currentThread().interrupt();
+            throw e;
         }
-        if (!process.waitFor(timeoutSeconds, TimeUnit.SECONDS)) {
+
+        IOException readError = outputFailure.get();
+        if (finished && readError != null) {
+            throw readError;
+        }
+        String output = buffer.toString(Charset.defaultCharset());
+        return finished
+                ? new Result(process.exitValue(), output, false)
+                : new Result(-1, output, true);
+    }
+
+    private static void stopProcessTree(Process process) {
+        List<ProcessHandle> descendants = process.descendants().toList();
+        for (int i = descendants.size() - 1; i >= 0; i--) {
+            ProcessHandle child = descendants.get(i);
+            if (child.isAlive()) {
+                child.destroy();
+            }
+        }
+        if (process.isAlive()) {
+            process.destroy();
+        }
+        try {
+            process.waitFor(250, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        for (int i = descendants.size() - 1; i >= 0; i--) {
+            ProcessHandle child = descendants.get(i);
+            if (child.isAlive()) {
+                child.destroyForcibly();
+            }
+        }
+        if (process.isAlive()) {
             process.destroyForcibly();
-            return new Result(-1, output, true);
+            try {
+                process.waitFor(1, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         }
-        return new Result(process.exitValue(), output, false);
+        try {
+            process.getInputStream().close();
+        } catch (IOException ignored) {
+            // 进程结束时管道通常已经关闭
+        }
+    }
+
+    private static void awaitOutput(Thread outputDrainer, Process process) throws InterruptedException {
+        outputDrainer.join(2_000);
+        if (!outputDrainer.isAlive()) {
+            return;
+        }
+        try {
+            process.getInputStream().close();
+        } catch (IOException ignored) {
+            // 关闭管道只是为了唤醒仍在读取的后台线程
+        }
+        outputDrainer.join(500);
     }
 
     static CommandRunner forCase(CaseSpec spec) {

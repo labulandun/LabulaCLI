@@ -624,7 +624,7 @@
 - E2：`PAICLI_OTEL_TRACES_EXPORTER=file` 同步落盘 span；artifact 聚合 llm token 三段口径与 tool 明细，自动产出 `tokens_total` / `llm_rounds` / `tool_calls` / `tool_error_rate` 指标分
 - E3：`SandboxExecutor` host / docker 两档，按爆炸半径分级；`SafetyGrader` 用审计日志 + 工作区外 canary 哨兵双证据链判定 `guards_held` / `guard_block_rate`；`SecretRedactor` 工件脱敏；`RuntimeApiServer` 可配置监听地址（默认仍绑回环）
 
-**当前边界**：E3 的 Docker 沙盒只服务评测 harness，不是产品运行时沙箱；E4 swe-lite/terminal suite、E5 LLM judge + 回归门禁未开发。
+**当前边界**：E3 的 Docker 沙盒只服务评测 harness，不是产品运行时沙箱；E4 开发中（terminal suite 5 条已在 Docker 中实际验收，HTTP 就绪探测、LF 资产契约、并发/pass@k/超时测试已落地，swe-lite 规模、独立 pass@1/pass@3 和性能验收待完成）；E5 LLM judge + 回归门禁未开发。
 
 详细文档：`docs/evaluation-system-design.md`
 

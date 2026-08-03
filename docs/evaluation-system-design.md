@@ -2,7 +2,7 @@
 
 > 状态：Phase E1 已交付（harness MVP + custom suite 10 条，入口 `com.paicli.eval.EvalMain`）；
 > Phase E2 已交付（file span exporter + 工件聚合 + tokens/rounds/tool_error_rate 指标 + `tool_selection` grader + tool-golden suite 5 条）；
-> Phase E3 已交付（Host/Docker 沙盒 + `safety` grader + canary 哨兵 + 工件脱敏 + safety suite 8 条）；E4–E5 未开发。
+> Phase E3 已交付（Host/Docker 沙盒 + `safety` grader + canary 哨兵 + 工件脱敏 + safety suite 8 条）；E4 开发中；E5 未开发。
 > 本文是评测体系的总设计 + 分阶段开发计划（Phase E1–E5）。
 > 前置依赖：`docs/langfuse-mvp-observability.md` 中已交付的 OpenTelemetry/Langfuse 埋点。
 
@@ -376,6 +376,8 @@ List<Score> grade(spec, artifact, ws) {
 ### Phase E4：swe-lite + terminal suite + 规模化执行
 
 范围：swe-lite case（git repo 快照 + issue 描述 + fail-to-pass 测试，先从本仓库历史 bug 造 10 条，再扩公开 Java 项目）；terminal suite（容器内命令任务：环境配置、构建修复、日志排查）；case 级并行执行（每 case 独立子进程/容器，天然可并行，限并发数）；`runs > 1` + pass@k。
+当前进度（2026-08-02）：terminal suite 5 条已在 Docker 中完成实际验收，shell fixture 固定 LF；Runtime API 使用 HTTP 级就绪探测规避 Docker 端口转发先于服务启动的竞态，并能在 provider 已流式输出时把最终回答写入事件；Git workspace 强制固定 commit；并发、重复运行/pass@k、命令超时已有回归测试；Docker command grader 与被测容器使用相同的资源/权限限制。swe-lite 规模、独立 pass@1/pass@3 报告和 `< 1 小时` 全量验收仍未完成。
+
 
 验收：全量 suite 一次跑完 < 1 小时（并发 4）；pass@1 与 pass@3 均出现在报告中。
 

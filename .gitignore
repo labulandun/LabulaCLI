@@ -13,6 +13,8 @@ target/
 
 # 日志
 *.log
+# terminal 日志排查评测所需的固定输入
+!eval/suites/terminal/tm-002-log-triage/fixture/app.log
 
 # 操作系统
 .DS_Store

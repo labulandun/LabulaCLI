@@ -127,7 +127,7 @@ public final class EvalMain {
     }
 
     /** 每个 unit 自带独立工作区与子进程，天然可并行；并发数由 --concurrency 限制。 */
-    private static void runUnits(List<Runnable> units, int concurrency) throws InterruptedException {
+    static void runUnits(List<Runnable> units, int concurrency) throws InterruptedException {
         if (units.isEmpty()) {
             return;
         }

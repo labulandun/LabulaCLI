@@ -841,7 +841,7 @@ public class Main {
         ToolRegistry registry = new ToolRegistry();
         registry.setProjectPath(Path.of(".").toAbsolutePath().normalize().toString());
         Agent agent = new Agent(llmClient, registry, tracing);
-        return agent.run(prompt);
+        return agent.runForResult(prompt);
     }
 
     private static DurableTaskManager openTaskManager(AtomicReference<LlmClient> llmClientRef, PaiCliTracing tracing) {

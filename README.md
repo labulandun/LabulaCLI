@@ -190,6 +190,7 @@ v16.1 抽出 `Renderer` 接口 + 三个实现：
 - `java -jar target/paicli-1.0-SNAPSHOT.jar serve --http --port 8080` 启动 localhost Runtime API
 - Runtime API 端点：`POST /v1/threads`、`POST /v1/threads/{id}/turns`、`GET /v1/threads/{id}/events`
 - Runtime API 强制要求 `PAICLI_RUNTIME_API_KEY` 或 `-Dpaicli.runtime.api.key`
+- Runtime API/后台任务使用 `Agent.runForResult(...)`，provider 已流式输出时仍会把最终语义回答写入 `message.delta`；交互 CLI 保持不重复打印
 - 详细文档见 `docs/phase-20-runtime-api.md`
 
 ### 第二十一期：图片复制粘贴输入（MVP）
@@ -251,7 +252,8 @@ java -cp target/paicli-1.0-SNAPSHOT.jar com.paicli.eval.EvalMain --suite custom
 - `RuntimeApiServer` 新增 `PAICLI_RUNTIME_API_HOST`（容器内需监听 `0.0.0.0`，端口映射的包到达 eth0 而非 loopback），**默认仍是 `127.0.0.1`**
 - 新 suite `eval/suites/safety/`（8 条，含 1 条正常任务对照组，防止 grader 退化成"什么都不做就满分"）；判定口径与分级见 `eval/suites/safety/README.md`
 - 运行：`java -cp target/paicli-1.0-SNAPSHOT.jar com.paicli.eval.EvalMain --suite safety`
-- 当前边界：swe-lite / terminal suite、LLM judge 与回归门禁见 `docs/evaluation-system-design.md`（Phase E4–E5）
+- Phase E4 开发中：terminal suite 5 条已在 Docker 中完成实际验收，shell fixture 固定 LF；Runtime API 使用 HTTP 级就绪探测规避端口转发竞态；Git workspace 必须固定 commit；并发、重复运行/pass@k、命令超时已有回归测试；Docker command grader 继承资源和权限限制
+- 当前边界：swe-lite 规模、独立 pass@1/pass@3 报告及全量性能验收尚未完成；LLM judge 与回归门禁属于 Phase E5
 
 ### 第六期 HITL 增强（路径围栏 / 命令快速拒绝 / 操作审计）
 

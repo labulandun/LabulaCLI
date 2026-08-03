@@ -2,6 +2,7 @@ package com.paicli.eval;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.eclipse.jgit.ignore.IgnoreNode;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -81,5 +82,51 @@ class SuiteLoaderTest {
         List<CaseSpec> cases = SuiteLoader.load(evalHome, List.of("custom"), null);
         assertEquals(1, cases.size());
         assertTrue(cases.get(0).graders().get(0).type().equals("output_assert"));
+    }
+
+    @Test
+    void gitWorkspacesRequirePinnedCommit() throws Exception {
+        Path caseDir = writeCase("swe-lite", "git-case", """
+                {"id":"git-case","prompt":"fix it",
+                 "workspace":{"git":{"repo":"repo"}},
+                 "graders":[{"type":"output_assert","contains":"ok"}]}
+                """);
+        Files.createDirectories(caseDir.resolve("repo"));
+
+        assertThrows(IllegalArgumentException.class,
+                () -> SuiteLoader.load(evalHome, List.of("swe-lite"), null));
+
+        writeCase("swe-lite", "git-case", """
+                {"id":"git-case","prompt":"fix it",
+                 "workspace":{"git":{"repo":"repo","commit":"abc123"}},
+                 "graders":[{"type":"output_assert","contains":"ok"}]}
+                """);
+        List<CaseSpec> cases = SuiteLoader.load(evalHome, List.of("swe-lite"), null);
+        assertEquals(1, cases.size());
+        assertEquals("abc123", cases.get(0).gitSource().commit());
+    }
+
+    @Test
+    void terminalLogFixtureIsNotIgnoredAndSuiteLoads() throws Exception {
+        Path projectRoot = Path.of("").toAbsolutePath().normalize();
+        String fixturePath = "eval/suites/terminal/tm-002-log-triage/fixture/app.log";
+
+        IgnoreNode ignoreNode = new IgnoreNode();
+        try (var input = Files.newInputStream(projectRoot.resolve(".gitignore"))) {
+            ignoreNode.parse(input);
+        }
+        assertEquals(IgnoreNode.MatchResult.NOT_IGNORED,
+                ignoreNode.isIgnored(fixturePath, false),
+                "terminal 日志 fixture 不能被项目 .gitignore 排除");
+
+        List<CaseSpec> cases = SuiteLoader.load(projectRoot.resolve("eval"), List.of("terminal"), null);
+        assertEquals(5, cases.size());
+        CaseSpec logTriage = cases.stream()
+                .filter(spec -> "tm-002-log-triage".equals(spec.id()))
+                .findFirst()
+                .orElseThrow();
+        Path appLog = logTriage.fixtureDir().resolve("app.log");
+        assertTrue(Files.isRegularFile(appLog));
+        assertTrue(Files.readString(appLog, StandardCharsets.UTF_8).contains("active_waiters=31"));
     }
 }
