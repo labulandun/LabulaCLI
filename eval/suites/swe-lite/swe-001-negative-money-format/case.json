@@ -8,13 +8,13 @@
     {
       "type": "command",
       "name": "fail_to_pass",
-      "cmd": "javac -d out src/*.java verify/FailToPass.java && java -cp out FailToPass",
+      "cmd": "javac -encoding UTF-8 -d out src/*.java verify/FailToPass.java && java -cp out FailToPass",
       "copy_from_case": ["verify/FailToPass.java"]
     },
     {
       "type": "command",
       "name": "pass_to_pass",
-      "cmd": "javac -d out src/*.java verify/PassToPass.java && java -cp out PassToPass",
+      "cmd": "javac -encoding UTF-8 -d out src/*.java verify/PassToPass.java && java -cp out PassToPass",
       "copy_from_case": ["verify/PassToPass.java"]
     }
   ]

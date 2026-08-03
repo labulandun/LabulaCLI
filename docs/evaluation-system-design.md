@@ -2,7 +2,9 @@
 
 > 状态：Phase E1 已交付（harness MVP + custom suite 10 条，入口 `com.paicli.eval.EvalMain`）；
 > Phase E2 已交付（file span exporter + 工件聚合 + tokens/rounds/tool_error_rate 指标 + `tool_selection` grader + tool-golden suite 5 条）；
-> Phase E3 已交付（Host/Docker 沙盒 + `safety` grader + canary 哨兵 + 工件脱敏 + safety suite 8 条）；E4 开发中；E5 未开发。
+> Phase E3 已交付（Host/Docker 沙盒 + `safety` grader + canary 哨兵 + 工件脱敏 + safety suite 8 条）；
+> Phase E4 已交付（terminal 5 条 + swe-lite 10 条 + 规模化执行）；
+> E5 未开发。
 > 本文是评测体系的总设计 + 分阶段开发计划（Phase E1–E5）。
 > 前置依赖：`docs/langfuse-mvp-observability.md` 中已交付的 OpenTelemetry/Langfuse 埋点。
 
@@ -375,11 +377,15 @@ List<Score> grade(spec, artifact, ws) {
 
 ### Phase E4：swe-lite + terminal suite + 规模化执行
 
-范围：swe-lite case（git repo 快照 + issue 描述 + fail-to-pass 测试，先从本仓库历史 bug 造 10 条，再扩公开 Java 项目）；terminal suite（容器内命令任务：环境配置、构建修复、日志排查）；case 级并行执行（每 case 独立子进程/容器，天然可并行，限并发数）；`runs > 1` + pass@k。
-当前进度（2026-08-02）：terminal suite 5 条已在 Docker 中完成实际验收，shell fixture 固定 LF；Runtime API 使用 HTTP 级就绪探测规避 Docker 端口转发先于服务启动的竞态，并能在 provider 已流式输出时把最终回答写入事件；Git workspace 强制固定 commit；并发、重复运行/pass@k、命令超时已有回归测试；Docker command grader 与被测容器使用相同的资源/权限限制。swe-lite 规模、独立 pass@1/pass@3 报告和 `< 1 小时` 全量验收仍未完成。
+范围（已交付）：
+terminal suite 5 条 Docker 命令任务；
+swe-lite 10 条本地可复现 issue fixture，每条包含隐藏 fail-to-pass / pass-to-pass 测试；
+case/run 级并行执行；全局重复运行覆盖与总时限验收。
+实现：`--runs <n>` 覆盖 case 自带 runs，`--concurrency <n>` 限并发，`--max-run-seconds <n>` 记录总 wall time 并在超预算时返回非零；
+报告保留 attempt 级 pass_rate、通用 pass@k，以及固定 pass@1/pass@3 与 coverage。固定 pass@k 仅统计至少执行 k 次的 case。
 
-
-验收：全量 suite 一次跑完 < 1 小时（并发 4）；pass@1 与 pass@3 均出现在报告中。
+资产约束：terminal shell fixture 固定 LF；Runtime API 使用 HTTP 级就绪探测；Git workspace 强制固定 commit；swe-lite 的 Java grader 固定 `-encoding UTF-8`，契约测试验证 baseline 上 fail-to-pass 必须失败、pass-to-pass 必须通过。
+验收（2026-08-03，通过）：Docker 29.2.1 下运行 terminal+swe-lite，15 case × 3 runs、并发 4，45 次全部执行且 0 skipped；43/45 run 通过，pass@1=14/15（0.9333），pass@3=15/15（1.0000），总 wall time 688.758 秒，小于 1 小时预算。
 
 ```java
 // 并行执行 + pass@k
@@ -401,7 +407,9 @@ Workspace provision(case) {
 
 ### Phase E5：业务效果（LLM judge）+ 回归门禁 + Langfuse 打通
 
-范围：LlmJudgeGrader（rubric 库：`code-quality-v1` / `answer-quality-v1`，judge 走 `LlmClientFactory` 可配 provider，判词与分数缓存进 artifact，防重复计费）；EvalCompare + baseline 机制 + `mvn -Peval-smoke`（挑 5–8 条快 case 做 CI 冒烟门禁）；Langfuse Score 批量上传 + Dataset Run 关联；生产 trace 抽样标注 SOP（每周从 Langfuse 抽 N 条真实使用 trace 人工打 `user_goal_met`，反哺 custom suite 造新 case）。
+范围：LlmJudgeGrader（rubric 库：`code-quality-v1` / `answer-quality-v1`，judge 走 `LlmClientFactory` 可配 provider，判词与分数缓存进 artifact，防重复计费）；
+EvalCompare + baseline 机制 + `mvn -Peval-smoke`（挑 5–8 条快 case 做 CI 冒烟门禁）；
+Langfuse Score 批量上传 + Dataset Run 关联；生产 trace 抽样标注 SOP（每周从 Langfuse 抽 N 条真实使用 trace 人工打 `user_goal_met`，反哺 custom suite 造新 case）。
 
 验收：judge 分与人工标注在 20 条样本上的一致率 ≥ 80% 才允许 judge 分进报告主表；EvalCompare 在故意注入的退化（如砍掉一个工具）上能报 FAIL。
 

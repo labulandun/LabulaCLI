@@ -1,0 +1,21 @@
+{
+  "id": "swe-009-task-queue-shutdown",
+  "suite": "swe-lite",
+  "workspace": { "fixture": "fixture" },
+  "prompt": "TaskQueue has inconsistent shutdown behavior: polling an empty queue throws and enqueue still accepts work after shutdown. Make empty poll return null, reject enqueue after shutdown with IllegalStateException, preserve FIFO order, and keep shutdown idempotent.",
+  "timeout_seconds": 600,
+  "graders": [
+    {
+      "type": "command",
+      "name": "fail_to_pass",
+      "cmd": "javac -encoding UTF-8 -d out src/*.java verify/FailToPass.java && java -cp out FailToPass",
+      "copy_from_case": ["verify/FailToPass.java"]
+    },
+    {
+      "type": "command",
+      "name": "pass_to_pass",
+      "cmd": "javac -encoding UTF-8 -d out src/*.java verify/PassToPass.java && java -cp out PassToPass",
+      "copy_from_case": ["verify/PassToPass.java"]
+    }
+  ]
+}

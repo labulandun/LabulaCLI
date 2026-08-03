@@ -2,6 +2,7 @@ package com.paicli.eval;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -18,6 +19,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class E4SuiteContractTest {
 
     private static final Path EVAL_HOME = Path.of("eval").toAbsolutePath().normalize();
+    @TempDir
+    Path tempDir;
+
 
     @Test
     void phaseE4SuitesLoadWithCompleteWorkspaceAssets() throws Exception {
@@ -35,6 +39,23 @@ class E4SuiteContractTest {
         assertTrue(terminal.stream().allMatch(spec -> "docker".equals(spec.sandbox())),
                 "terminal 用例必须显式使用 Docker 沙盒");
         assertFalse(sweLite.isEmpty(), "swe-lite suite 至少应可加载现有基础用例");
+
+        assertEquals(10, sweLite.size(), "swe-lite suite must contain the ten E4 cases");
+        assertEquals(Set.of(
+                        "swe-001-negative-money-format",
+                        "swe-002-null-category-crash",
+                        "swe-003-report-subtotals",
+                        "swe-004-csv-quoted-fields",
+                        "swe-005-date-range-inclusive",
+                        "swe-006-lru-access-order",
+                        "swe-007-safe-path-join",
+                        "swe-008-retry-delay-cap",
+                        "swe-009-task-queue-shutdown",
+                        "swe-010-properties-preserve"),
+                sweLite.stream().map(CaseSpec::id).collect(java.util.stream.Collectors.toSet()));
+        assertTrue(sweLite.stream().flatMap(spec -> spec.graders().stream())
+                        .allMatch(grader -> grader.text("cmd", "").contains("javac -encoding UTF-8")),
+                "swe-lite javac graders must pin UTF-8 for cross-platform model edits");
 
         List<CaseSpec> all = java.util.stream.Stream.concat(terminal.stream(), sweLite.stream()).toList();
         assertEquals(all.size(), new HashSet<>(all.stream().map(CaseSpec::id).toList()).size(),
@@ -55,6 +76,34 @@ class E4SuiteContractTest {
                 for (byte value : content) {
                     assertFalse(value == '\r', "Docker shell fixture 不能包含 CR/CRLF: " + script);
                 }
+            }
+        }
+    }
+
+
+    @Test
+    void sweLiteBaselinesFailTargetTestsAndPassRegressionTests() throws Exception {
+        List<CaseSpec> cases = SuiteLoader.load(EVAL_HOME, List.of("swe-lite"), null);
+        for (CaseSpec spec : cases) {
+            Workspace workspace = Workspace.provision(spec, tempDir.resolve(spec.id()));
+            try {
+                Set<String> graderNames = new HashSet<>();
+                for (GraderSpec graderSpec : spec.graders()) {
+                    String name = graderSpec.text("name", "tests_pass");
+                    graderNames.add(name);
+                    List<Score> scores = new CommandGrader(graderSpec, new CommandRunner.Host())
+                            .grade(spec, EvalFixtures.artifact(spec.id()), workspace.root());
+                    assertEquals(1, scores.size(), "one score per command grader: " + spec.id());
+                    if ("fail_to_pass".equals(name)) {
+                        assertFalse(scores.get(0).passed(), "baseline must expose target bug: " + spec.id());
+                    } else if ("pass_to_pass".equals(name)) {
+                        assertTrue(scores.get(0).passed(), "baseline regression failed: " + spec.id());
+                    }
+                }
+                assertEquals(Set.of("fail_to_pass", "pass_to_pass"), graderNames,
+                        "swe-lite cases require both hidden test groups: " + spec.id());
+            } finally {
+                workspace.deleteQuietly();
             }
         }
     }

@@ -13,6 +13,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class EvalMainConcurrencyTest {
@@ -76,5 +77,16 @@ class EvalMainConcurrencyTest {
                 () -> order.add(2),
                 () -> order.add(3)), 1);
         assertEquals(List.of(1, 2, 3), order);
+    }
+
+    @Test
+    void runsOverrideAndPositiveOptionsAreValidated() {
+        CaseSpec spec = EvalFixtures.caseSpec("runs-case");
+
+        assertEquals(1, EvalMain.effectiveRuns(spec, null));
+        assertEquals(3, EvalMain.effectiveRuns(spec, 3));
+        assertEquals(4, EvalMain.positiveInt("concurrency", "4"));
+        assertThrows(IllegalArgumentException.class, () -> EvalMain.positiveInt("runs", "0"));
+        assertThrows(IllegalArgumentException.class, () -> EvalMain.positiveInt("runs", "not-a-number"));
     }
 }

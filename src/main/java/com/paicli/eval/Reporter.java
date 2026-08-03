@@ -50,11 +50,20 @@ public final class Reporter {
         summary.put("tool_calls", toolCalls);
         summary.put("tool_errors", toolErrors);
         summary.put("tool_error_rate", toolCalls == 0 ? 0.0 : round4((double) toolErrors / toolCalls));
+        copyLongMeta(summary, runMeta, "run_wall_time_ms");
+        copyLongMeta(summary, runMeta, "max_run_seconds");
+        copyLongMeta(summary, runMeta, "scheduled_runs");
+        String withinBudget = runMeta.get("within_time_budget");
+        if (withinBudget != null) {
+            summary.put("within_time_budget", Boolean.parseBoolean(withinBudget));
+        }
 
         List<PassAtK> passAtK = passAtK(executed);
         long solved = passAtK.stream().filter(PassAtK::solved).count();
         summary.put("cases_with_runs", passAtK.size());
         summary.put("pass_at_k", passAtK.isEmpty() ? 0.0 : round4((double) solved / passAtK.size()));
+        appendFixedPassAtKJson(summary, "pass_at_1", fixedPassAtK(executed, 1));
+        appendFixedPassAtKJson(summary, "pass_at_3", fixedPassAtK(executed, 3));
         ArrayNode passAtKNode = summary.putArray("pass_at_k_detail");
         for (PassAtK entry : passAtK) {
             ObjectNode node = passAtKNode.addObject();
@@ -71,6 +80,8 @@ public final class Reporter {
             suiteNode.put("executed", entry.getValue().size());
             suiteNode.put("passed", suitePassed);
             suiteNode.put("pass_rate", round4((double) suitePassed / entry.getValue().size()));
+            appendFixedPassAtKJson(suiteNode, "pass_at_1", fixedPassAtK(entry.getValue(), 1));
+            appendFixedPassAtKJson(suiteNode, "pass_at_3", fixedPassAtK(entry.getValue(), 3));
         }
 
         ArrayNode cases = root.putArray("cases");
@@ -130,6 +141,7 @@ public final class Reporter {
             md.append(String.format("（另有 %d 条 skipped）", results.size() - executed.size()));
         }
         md.append("\n\n");
+        appendFixedPassAtKSection(md, executed);
         appendPassAtKSection(md, executed);
         md.append("| case | status | task_success | wall_time | tokens | rounds | tools | files± | scores |\n");
         md.append("|------|--------|--------------|-----------|--------|--------|-------|--------|--------|\n");
@@ -170,6 +182,31 @@ public final class Reporter {
         return md.toString();
     }
 
+    /**
+     * Fixed pass@1 / pass@3 metrics. A case is eligible only after k runs actually executed.
+     */
+
+    private static void appendFixedPassAtKSection(StringBuilder md, List<CaseResult> executed) {
+        FixedPassAtK passAtOne = fixedPassAtK(executed, 1);
+        FixedPassAtK passAtThree = fixedPassAtK(executed, 3);
+        md.append("## Fixed pass@k\n\n");
+        md.append(fixedPassAtKLine(passAtOne)).append("\n\n");
+        md.append(fixedPassAtKLine(passAtThree));
+        if (passAtThree.eligibleCases() < passAtThree.totalCases()) {
+            md.append(String.format(" (%d cases have fewer than 3 runs)",
+                    passAtThree.totalCases() - passAtThree.eligibleCases()));
+        }
+        md.append("\n\n");
+    }
+
+    private static String fixedPassAtKLine(FixedPassAtK metric) {
+        if (metric.eligibleCases() == 0) {
+            return String.format("**pass@%d: n/a (0/%d cases covered)**",
+                    metric.k(), metric.totalCases());
+        }
+        return String.format("**pass@%d: %d/%d (%.4f)**",
+                metric.k(), metric.solvedCases(), metric.eligibleCases(), metric.rate());
+    }
     /**
      * 只在真的跑了多遍时才列 pass@k：k=1 时它恒等于 pass_rate，多印一遍是噪音。
      * 同时把"多遍里时好时坏"的 case 单独点出来——那是抖动，不是能力。
@@ -260,6 +297,51 @@ public final class Reporter {
     record PassAtK(String caseId, int k, int passedRuns, boolean solved) {
     }
 
+
+    /** A fixed-k metric. Only cases with at least k executed runs are eligible. */
+    record FixedPassAtK(int k, int solvedCases, int eligibleCases, int totalCases, double rate) {
+    }
+
+    private static void appendFixedPassAtKJson(ObjectNode target, String field, FixedPassAtK metric) {
+        if (metric.eligibleCases() == 0) {
+            target.putNull(field);
+        } else {
+            target.put(field, metric.rate());
+        }
+        target.put(field + "_solved", metric.solvedCases());
+        target.put(field + "_cases", metric.eligibleCases());
+        target.put(field + "_total_cases", metric.totalCases());
+    }
+
+    /**
+     * Sort runs by run_index. pass@k means that at least one of the first k runs passed.
+     * Cases with fewer than k real runs stay out of the denominator and are reported as uncovered.
+     */
+    static FixedPassAtK fixedPassAtK(List<CaseResult> executed, int k) {
+        if (k < 1) {
+            throw new IllegalArgumentException("k must be greater than 0");
+        }
+        Map<String, List<CaseResult>> byCase = new LinkedHashMap<>();
+        for (CaseResult result : executed) {
+            String key = result.suite() + "\u0000" + result.caseId();
+            byCase.computeIfAbsent(key, ignored -> new java.util.ArrayList<>()).add(result);
+        }
+        int eligible = 0;
+        int solved = 0;
+        for (List<CaseResult> runs : byCase.values()) {
+            runs.sort(java.util.Comparator.comparingInt(CaseResult::runIndex));
+            if (runs.size() < k) {
+                continue;
+            }
+            eligible++;
+            if (runs.stream().limit(k).anyMatch(CaseResult::taskSuccess)) {
+                solved++;
+            }
+        }
+        return new FixedPassAtK(k, solved, eligible, byCase.size(),
+                eligible == 0 ? 0.0 : round4((double) solved / eligible));
+    }
+
     /** 按 case 聚合多次运行。k=1 时 pass@k 等价于 pass_rate，抗随机性要靠 case.json 里配 runs>1。 */
     static List<PassAtK> passAtK(List<CaseResult> executed) {
         Map<String, List<CaseResult>> byCase = new LinkedHashMap<>();
@@ -285,6 +367,28 @@ public final class Reporter {
         return solved + "/" + entries.size() + " (k=" + maxK + ")";
     }
 
+
+    /** Fixed-k summary for the EvalMain completion line. */
+    public static String fixedPassAtKSummary(List<CaseResult> results, int k) {
+        FixedPassAtK metric = fixedPassAtK(results.stream().filter(CaseResult::executed).toList(), k);
+        if (metric.eligibleCases() == 0) {
+            return "n/a (0/" + metric.totalCases() + " cases covered)";
+        }
+        return metric.solvedCases() + "/" + metric.eligibleCases()
+                + " (" + String.format(java.util.Locale.ROOT, "%.4f", metric.rate()) + ")";
+    }
+
+    private static void copyLongMeta(ObjectNode target, Map<String, String> runMeta, String key) {
+        String value = runMeta.get(key);
+        if (value == null) {
+            return;
+        }
+        try {
+            target.put(key, Long.parseLong(value));
+        } catch (NumberFormatException ignored) {
+            // Keep malformed optional metadata out of the machine-readable summary.
+        }
+    }
     private static Map<String, List<CaseResult>> groupBySuite(List<CaseResult> executed) {
         Map<String, List<CaseResult>> grouped = new LinkedHashMap<>();
         for (CaseResult result : executed) {

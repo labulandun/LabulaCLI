@@ -106,9 +106,47 @@ class ReporterTest {
         assertEquals(3, detail.get(1).path("k").asInt());
         assertEquals(1, detail.get(1).path("passed_runs").asInt());
         assertTrue(detail.get(1).path("solved").asBoolean());
+        var summary = report.path("summary");
+        assertEquals(0.5, summary.path("pass_at_1").asDouble());
+        assertEquals(1, summary.path("pass_at_1_solved").asInt());
+        assertEquals(2, summary.path("pass_at_1_cases").asInt());
+        assertEquals(2, summary.path("pass_at_1_total_cases").asInt());
+        assertEquals(1.0, summary.path("pass_at_3").asDouble());
+        assertEquals(1, summary.path("pass_at_3_solved").asInt());
+        assertEquals(1, summary.path("pass_at_3_cases").asInt());
+        assertEquals(2, summary.path("pass_at_3_total_cases").asInt());
 
         String markdown = Reporter.buildMarkdown(Map.of("run_id", "r-pass-k"), results);
         assertTrue(markdown.contains("| pass-one | 1 | 1 |"));
         assertTrue(markdown.contains("| pass-three | 3 | 1 |"));
+        assertTrue(markdown.contains("**pass@1: 1/2 (0.5000)**"));
+        assertTrue(markdown.contains("**pass@3: 1/1 (1.0000)**"));
+        assertTrue(markdown.contains("1 cases have fewer than 3 runs"));
+    }
+
+    @Test
+    void fixedPassAtThreeRequiresCoverageAndUsesRunIndexOrder() {
+        List<CaseResult> results = List.of(
+                outcome("late-only", 4, true),
+                outcome("late-only", 2, false),
+                outcome("late-only", 1, false),
+                outcome("late-only", 3, false),
+                outcome("shuffled", 3, true),
+                outcome("shuffled", 1, false),
+                outcome("shuffled", 2, false),
+                outcome("single", 1, true));
+
+        ObjectNode report = Reporter.buildJson(Map.of(
+                "run_id", "r-fixed-k",
+                "run_wall_time_ms", "1234",
+                "max_run_seconds", "3600",
+                "scheduled_runs", "8",
+                "within_time_budget", "true"), results);
+        var summary = report.path("summary");
+        assertEquals(0.5, summary.path("pass_at_3").asDouble());
+        assertEquals(2, summary.path("pass_at_3_cases").asInt());
+        assertEquals(3, summary.path("pass_at_3_total_cases").asInt());
+        assertEquals(1234, summary.path("run_wall_time_ms").asLong());
+        assertTrue(summary.path("within_time_budget").asBoolean());
     }
 }

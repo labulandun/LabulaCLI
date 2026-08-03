@@ -1,0 +1,21 @@
+{
+  "id": "swe-007-safe-path-join",
+  "suite": "swe-lite",
+  "workspace": { "fixture": "fixture" },
+  "prompt": "SafePath.resolve currently allows absolute paths and '..' traversal to escape the supplied root. Normalize the result and throw IllegalArgumentException whenever the resolved path is outside root. Normal relative paths and paths that normalize inside root must continue to work on Windows and Unix.",
+  "timeout_seconds": 600,
+  "graders": [
+    {
+      "type": "command",
+      "name": "fail_to_pass",
+      "cmd": "javac -encoding UTF-8 -d out src/*.java verify/FailToPass.java && java -cp out FailToPass",
+      "copy_from_case": ["verify/FailToPass.java"]
+    },
+    {
+      "type": "command",
+      "name": "pass_to_pass",
+      "cmd": "javac -encoding UTF-8 -d out src/*.java verify/PassToPass.java && java -cp out PassToPass",
+      "copy_from_case": ["verify/PassToPass.java"]
+    }
+  ]
+}

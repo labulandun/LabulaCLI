@@ -61,15 +61,19 @@ public final class EvalMain {
             System.exit(2);
         }
 
+        long runStartNanos = System.nanoTime();
         String runId = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"));
         Path runDir = projectRoot.resolve(options.getOrDefault("out", "eval/runs")).resolve(runId);
         Files.createDirectories(runDir);
         boolean keepWorkspace = options.containsKey("keep-workspace");
         Integer timeoutOverride = options.containsKey("timeout")
-                ? Integer.parseInt(options.get("timeout")) : null;
+                ? positiveIntOption(options, "timeout") : null;
+        Integer runsOverride = options.containsKey("runs") ? positiveIntOption(options, "runs") : null;
+        Integer maxRunSeconds = options.containsKey("max-run-seconds")
+                ? positiveIntOption(options, "max-run-seconds") : null;
         Map<String, String> dotEnv = DotEnv.read(projectRoot.resolve(".env"));
         SecretRedactor redactor = new SecretRedactor(dotEnv);
-        int concurrency = Math.max(1, Integer.parseInt(options.getOrDefault("concurrency", "4")));
+        int concurrency = positiveInt("concurrency", options.getOrDefault("concurrency", "4"));
         PortAllocator ports = new PortAllocator();
 
         Map<String, String> runMeta = new LinkedHashMap<>();
@@ -79,6 +83,12 @@ public final class EvalMain {
         runMeta.put("jar", jar.toString());
         runMeta.put("suites", String.join(",", suites));
         runMeta.put("concurrency", String.valueOf(concurrency));
+        if (runsOverride != null) {
+            runMeta.put("runs_override", String.valueOf(runsOverride));
+        }
+        if (maxRunSeconds != null) {
+            runMeta.put("max_run_seconds", String.valueOf(maxRunSeconds));
+        }
         writeJson(runDir.resolve("run-meta.json"), toObjectNode(runMeta));
 
         System.out.println("🧪 PaiCLI Eval run " + runId + "：共 " + cases.size() + " 条用例");
@@ -101,7 +111,7 @@ public final class EvalMain {
                 results.add(CaseResult.skipped(spec, skipReason));
                 continue;
             }
-            for (int runIndex = 1; runIndex <= spec.runs(); runIndex++) {
+            for (int runIndex = 1; runIndex <= effectiveRuns(spec, runsOverride); runIndex++) {
                 int slot = slots.size();
                 int currentRun = runIndex;
                 slots.add(null);
@@ -118,12 +128,30 @@ public final class EvalMain {
         runUnits(units, concurrency);
         slots.stream().filter(java.util.Objects::nonNull).forEach(results::add);
 
+        long runWallTimeMs = (System.nanoTime() - runStartNanos) / 1_000_000;
+        runMeta.put("completed_at", LocalDateTime.now().toString());
+        runMeta.put("run_wall_time_ms", String.valueOf(runWallTimeMs));
+        runMeta.put("scheduled_runs", String.valueOf(units.size()));
+        boolean withinTimeBudget = maxRunSeconds == null || runWallTimeMs <= maxRunSeconds * 1000L;
+        if (maxRunSeconds != null) {
+            runMeta.put("within_time_budget", String.valueOf(withinTimeBudget));
+        }
+        writeJson(runDir.resolve("run-meta.json"), toObjectNode(runMeta));
         Reporter.write(runDir, runMeta, results);
+
         long executed = results.stream().filter(CaseResult::executed).count();
         long passed = results.stream().filter(CaseResult::taskSuccess).count();
         System.out.println("\n📊 pass_rate: " + passed + "/" + executed
                 + "，pass@k: " + Reporter.passAtKSummary(results)
                 + "，报告: " + runDir.resolve("report.md"));
+        System.out.println("   pass@1: " + Reporter.fixedPassAtKSummary(results, 1)
+                + ", pass@3: " + Reporter.fixedPassAtKSummary(results, 3)
+                + ", wall: " + runWallTimeMs / 1000.0 + "s");
+        if (!withinTimeBudget) {
+            System.err.println("Performance budget exceeded: " + runWallTimeMs + "ms > "
+                    + maxRunSeconds * 1000L + "ms");
+            System.exit(3);
+        }
     }
 
     /** 每个 unit 自带独立工作区与子进程，天然可并行；并发数由 --concurrency 限制。 */
@@ -343,6 +371,26 @@ public final class EvalMain {
         return e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
     }
 
+    static int effectiveRuns(CaseSpec spec, Integer runsOverride) {
+        return runsOverride == null ? spec.runs() : runsOverride;
+    }
+
+    private static int positiveIntOption(Map<String, String> options, String name) {
+        return positiveInt(name, options.get(name));
+    }
+
+    static int positiveInt(String name, String value) {
+        try {
+            int parsed = Integer.parseInt(value);
+            if (parsed < 1) {
+                throw new IllegalArgumentException("--" + name + " must be greater than 0");
+            }
+            return parsed;
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("--" + name + " must be an integer: " + value, e);
+        }
+    }
+
     private static Map<String, String> parseArgs(String[] args) {
         Map<String, String> options = new LinkedHashMap<>();
         for (int i = 0; i < args.length; i++) {
@@ -373,6 +421,8 @@ public final class EvalMain {
                   --eval-home <dir>    eval 根目录（默认 eval）
                   --out <dir>          输出目录（默认 eval/runs）
                   --timeout <seconds>  覆盖所有 case 的超时
+                  --runs <n>           覆盖每条 case 的重复次数（pass@3 建议设 3）
+                  --max-run-seconds <n> 记录并检查全量运行的总耗时预算
                   --concurrency <n>    并行执行的 case 数（默认 4，设 1 退回串行）
                   --keep-workspace     保留工作区现场用于排查（safety 用例排查时建议开）
                   --help               显示本帮助
