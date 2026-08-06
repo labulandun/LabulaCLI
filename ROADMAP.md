@@ -616,16 +616,17 @@
 
 ---
 
-## 横向能力：评测体系 ✅ Phase E1–E4（Harness + 工件聚合 + 安全评测 + 规模化执行）
+## 横向能力：评测体系 ✅ Phase E1–E4 / 🟡 Phase E5 第一批
 
 - `com.paicli.eval.EvalMain` 独立入口：黑盒驱动 `serve --http` 子进程，每 case 一次性工作区（fixture + JGit baseline）
-- Runtime API 提交任务并轮询终态；`command` / `output_assert` / `file_assert` / `tool_selection` / `safety` 五类 grader，`task_success` 复合分
+- Runtime API 提交任务并轮询终态；`command` / `output_assert` / `file_assert` / `tool_selection` / `safety` 五类门槛 grader，加上显式启用且非门禁的 `llm_judge`；`task_success` 至少需要一个 BOOLEAN 断言
 - 五个 suite：`custom` 10 条 + `tool-golden` 5 条 + `safety` 8 条 + `terminal` 5 条 + `swe-lite` 10 条；输出 `eval/runs/<run-id>/report.{json,md}` + 每 case artifact / diff / transcript / spans.jsonl
 - E2：`PAICLI_OTEL_TRACES_EXPORTER=file` 同步落盘 span；artifact 聚合 llm token 三段口径与 tool 明细，自动产出 `tokens_total` / `llm_rounds` / `tool_calls` / `tool_error_rate` 指标分
 - E3：`SandboxExecutor` host / docker 两档，按爆炸半径分级；`SafetyGrader` 用审计日志 + 工作区外 canary 哨兵双证据链判定 `guards_held` / `guard_block_rate`；`SecretRedactor` 工件脱敏；`RuntimeApiServer` 可配置监听地址（默认仍绑回环）
 - E4：新增 terminal 5 条与 swe-lite 10 条，支持全局 `--runs`、并发 run、固定 pass@1/pass@3 + coverage，以及 `--max-run-seconds` 总时限验收；2026-08-03 实跑 15 case × 3 runs，43/45 通过、pass@3=1.0000、耗时 688.758 秒
+- E5 第一批：固定 artifact/report `schema_version=1` 与 skip 工件契约；交付版本化 rubric、off/cache-only/live Judge、内容寻址缓存、校准计算器，以及可独立运行或挂到 `EvalMain --baseline` 的 `EvalCompare`
 
-**当前边界**：E3/E4 的 Docker 沙盒只服务评测 harness，不是产品运行时沙箱；E5 LLM judge + 回归门禁未开发。
+**当前边界**：E3/E4 的 Docker 沙盒只服务评测 harness，不是产品运行时沙箱；E5 的 Langfuse 打通、Maven CI、线上 20 样本 Judge 校准、全量验收与 SOP 暂缓。
 
 详细文档：`docs/evaluation-system-design.md`
 

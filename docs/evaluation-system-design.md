@@ -4,7 +4,7 @@
 > Phase E2 已交付（file span exporter + 工件聚合 + tokens/rounds/tool_error_rate 指标 + `tool_selection` grader + tool-golden suite 5 条）；
 > Phase E3 已交付（Host/Docker 沙盒 + `safety` grader + canary 哨兵 + 工件脱敏 + safety suite 8 条）；
 > Phase E4 已交付（terminal 5 条 + swe-lite 10 条 + 规模化执行）；
-> E5 未开发。
+> Phase E5 第一批已交付（E1–E4 契约固定 + LLM Judge 核心 + Baseline Compare）；Langfuse、Maven CI、线上校准、全量验收与 SOP 暂缓。
 > 本文是评测体系的总设计 + 分阶段开发计划（Phase E1–E5）。
 > 前置依赖：`docs/langfuse-mvp-observability.md` 中已交付的 OpenTelemetry/Langfuse 埋点。
 
@@ -407,11 +407,14 @@ Workspace provision(case) {
 
 ### Phase E5：业务效果（LLM judge）+ 回归门禁 + Langfuse 打通
 
-范围：LlmJudgeGrader（rubric 库：`code-quality-v1` / `answer-quality-v1`，judge 走 `LlmClientFactory` 可配 provider，判词与分数缓存进 artifact，防重复计费）；
-EvalCompare + baseline 机制 + `mvn -Peval-smoke`（挑 5–8 条快 case 做 CI 冒烟门禁）；
-Langfuse Score 批量上传 + Dataset Run 关联；生产 trace 抽样标注 SOP（每周从 Langfuse 抽 N 条真实使用 trace 人工打 `user_goal_met`，反哺 custom suite 造新 case）。
+第一批已交付（2026-08-03）：
 
-验收：judge 分与人工标注在 20 条样本上的一致率 ≥ 80% 才允许 judge 分进报告主表；EvalCompare 在故意注入的退化（如砍掉一个工具）上能报 FAIL。
+- E1–E4 契约固定：case artifact 与 report 使用 `schema_version=1`；skip 也落独立 artifact；`task_success` 至少需要一个 BOOLEAN 断言，NUMERIC-only 不再真空通过
+- `LlmJudgeGrader`：`code-quality-v1` / `answer-quality-v1` 版本化 rubric；复用 `LlmClientFactory`；支持 `off` / `cache-only` / `live`；task/answer/diff 视为不可信数据，answer/diff 复用现有工件脱敏链；严格解析 1–5 分 JSON；内容寻址缓存只保存 score/reason/provider/model/rubric
+- `JudgeCalibration`：固定最少 20 个唯一样本、误差容忍 1 分、一致率门槛 80% 的纯计算契约；尚未执行线上 20 样本校准，因此官方 E1–E4 suite 暂不声明 `llm_judge`，Judge 分永不参与 `task_success` 或 CI 门禁
+- `EvalCompare`：支持独立 CLI 与 `EvalMain --baseline`；检查 case/run 集合、执行覆盖、pass_rate、每 run token 中位数和 `guard_block_rate`；策略文件使用严格 `schema_version=1`，默认阈值位于 `eval/baselines/default-policy.json`；输出 `compare.json` / `compare.md`，返回码 0/1/2 分别表示通过/回归/输入错误
+
+核心验收已覆盖 Judge 严格解析、模式切换、缓存并发/原子写、非门禁失败、校准边界，以及 EvalCompare 阈值边界、故意退化、legacy baseline 和退出码。暂缓：Langfuse Score / Dataset Run 打通、`mvn -Peval-smoke`、线上 20 样本校准、全量验收与生产 trace 标注 SOP。
 
 ```java
 // LlmJudgeGrader（judge 输出强制 JSON）

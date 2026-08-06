@@ -7,4 +7,9 @@ import java.util.List;
 public interface Grader {
 
     List<Score> grade(CaseSpec spec, RunArtifact artifact, Path workspace) throws Exception;
+
+    default List<Score> grade(CaseSpec spec, RunArtifact artifact, Path workspace,
+                              GraderContext context) throws Exception {
+        return grade(spec, artifact, workspace);
+    }
 }

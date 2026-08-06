@@ -15,11 +15,12 @@ public record CaseResult(String caseId,
                          String skipReason) {
 
     public static CaseResult of(CaseSpec spec, int runIndex, RunArtifact artifact, List<Score> scores) {
+        List<Score> assertions = scores.stream()
+                .filter(s -> s.dataType() == Score.DataType.BOOLEAN)
+                .toList();
         boolean success = "completed".equals(artifact.status())
-                && !scores.isEmpty()
-                && scores.stream()
-                        .filter(s -> s.dataType() == Score.DataType.BOOLEAN)
-                        .allMatch(Score::passed);
+                && !assertions.isEmpty()
+                && assertions.stream().allMatch(Score::passed);
         return new CaseResult(spec.id(), spec.suite(), runIndex, artifact, List.copyOf(scores), success, null);
     }
 

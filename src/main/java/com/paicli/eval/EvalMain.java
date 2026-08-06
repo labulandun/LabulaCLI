@@ -4,6 +4,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.paicli.config.PaiCliConfig;
+import com.paicli.llm.LlmClient;
+import com.paicli.llm.LlmClientFactory;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.lib.ObjectId;
 
@@ -36,6 +39,7 @@ import java.util.concurrent.Future;
  */
 public final class EvalMain {
 
+    static final int ARTIFACT_SCHEMA_VERSION = 1;
     private static final ObjectMapper MAPPER = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
 
     private EvalMain() {
@@ -76,6 +80,8 @@ public final class EvalMain {
         int concurrency = positiveInt("concurrency", options.getOrDefault("concurrency", "4"));
         PortAllocator ports = new PortAllocator();
 
+        LlmJudgeGrader.Dependencies judgeDependencies =
+                hasJudge(cases) ? createJudgeDependencies(options, projectRoot, evalHome) : null;
         Map<String, String> runMeta = new LinkedHashMap<>();
         runMeta.put("run_id", runId);
         runMeta.put("started_at", LocalDateTime.now().toString());
@@ -85,6 +91,13 @@ public final class EvalMain {
         runMeta.put("concurrency", String.valueOf(concurrency));
         if (runsOverride != null) {
             runMeta.put("runs_override", String.valueOf(runsOverride));
+        }
+        if (judgeDependencies != null) {
+            runMeta.put("judge_mode", judgeDependencies.mode().cliName());
+            runMeta.put("judge_provider", judgeDependencies.provider());
+            runMeta.put("judge_model", judgeDependencies.model());
+            runMeta.put("judge_cache_schema", String.valueOf(JudgeCache.SCHEMA_VERSION));
+            runMeta.put("judge_rubrics", judgeRubrics(cases));
         }
         if (maxRunSeconds != null) {
             runMeta.put("max_run_seconds", String.valueOf(maxRunSeconds));
@@ -108,7 +121,10 @@ public final class EvalMain {
             String skipReason = sandboxSkipReason(spec, docker);
             if (skipReason != null) {
                 System.out.println("⏭ " + spec.id() + "：" + skipReason);
-                results.add(CaseResult.skipped(spec, skipReason));
+                CaseResult skipped = CaseResult.skipped(spec, skipReason);
+                results.add(skipped);
+                writeArtifactJson(runDir.resolve("cases").resolve(spec.id()).resolve("run-1")
+                        .resolve("artifact.json"), skipped);
                 continue;
             }
             for (int runIndex = 1; runIndex <= effectiveRuns(spec, runsOverride); runIndex++) {
@@ -117,7 +133,7 @@ public final class EvalMain {
                 slots.add(null);
                 units.add(() -> {
                     CaseResult result = runCase(spec, currentRun, timeoutOverride, jar, runDir, dotEnv,
-                            redactor, ports, keepWorkspace);
+                            redactor, ports, keepWorkspace, judgeDependencies);
                     slots.set(slot, result);
                     System.out.println((result.taskSuccess() ? "✅ " : "❌ ") + spec.id()
                             + " run-" + currentRun + " (" + result.artifact().status()
@@ -139,6 +155,7 @@ public final class EvalMain {
         writeJson(runDir.resolve("run-meta.json"), toObjectNode(runMeta));
         Reporter.write(runDir, runMeta, results);
 
+        int compareExit = compareBaseline(options, projectRoot, evalHome, runDir);
         long executed = results.stream().filter(CaseResult::executed).count();
         long passed = results.stream().filter(CaseResult::taskSuccess).count();
         System.out.println("\n📊 pass_rate: " + passed + "/" + executed
@@ -151,6 +168,9 @@ public final class EvalMain {
             System.err.println("Performance budget exceeded: " + runWallTimeMs + "ms > "
                     + maxRunSeconds * 1000L + "ms");
             System.exit(3);
+        }
+        if (compareExit != 0) {
+            System.exit(compareExit);
         }
     }
 
@@ -191,7 +211,8 @@ public final class EvalMain {
                                       Map<String, String> dotEnv,
                                       SecretRedactor redactor,
                                       PortAllocator ports,
-                                      boolean keepWorkspace) {
+                                      boolean keepWorkspace,
+                                      LlmJudgeGrader.Dependencies judgeDependencies) {
         Path caseRunDir = runDir.resolve("cases").resolve(spec.id()).resolve("run-" + runIndex);
         Workspace workspace = null;
         PaiCliProcess process = null;
@@ -241,10 +262,12 @@ public final class EvalMain {
                             + (outcome.error() == null ? "" : "\nerror: " + outcome.error())
                             + "\n\nfinal answer:\n" + outcome.finalAnswer() + "\n",
                     StandardCharsets.UTF_8);
-            Files.writeString(caseRunDir.resolve("workspace.diff"),
-                    redactor.redact(diff.patch()), StandardCharsets.UTF_8);
+            String workspaceDiff = redactor.redact(diff.patch());
+            Files.writeString(caseRunDir.resolve("workspace.diff"), workspaceDiff, StandardCharsets.UTF_8);
 
-            List<Score> scores = gradeAll(spec, artifact, workspace.root(), commandRunner);
+            GraderContext graderContext = new GraderContext(caseRunDir, workspaceDiff);
+            List<Score> scores = gradeAll(spec, artifact, workspace.root(), commandRunner,
+                    judgeDependencies, graderContext);
             scores.addAll(SpanArtifacts.metricScores(artifact));
             CaseResult result = CaseResult.of(spec, runIndex, artifact, scores);
             writeArtifactJson(caseRunDir.resolve("artifact.json"), result);
@@ -321,12 +344,20 @@ public final class EvalMain {
 
     /** 单个 grader 抛异常不拖垮整条 case：记 0 分并把原因写进 comment。 */
     private static List<Score> gradeAll(CaseSpec spec, RunArtifact artifact, Path workspaceRoot,
-                                        CommandRunner runner) {
+                                        CommandRunner runner,
+                                        LlmJudgeGrader.Dependencies judgeDependencies,
+                                        GraderContext graderContext) {
         List<Score> scores = new ArrayList<>();
         for (GraderSpec graderSpec : spec.graders()) {
             try {
-                scores.addAll(GraderFactory.create(graderSpec, runner).grade(spec, artifact, workspaceRoot));
+                scores.addAll(GraderFactory.create(graderSpec, runner, judgeDependencies)
+                        .grade(spec, artifact, workspaceRoot, graderContext));
             } catch (Exception e) {
+                if ("llm_judge".equals(graderSpec.type())) {
+                    scores.add(new Score("judge_error", 1.0, Score.DataType.NUMERIC,
+                            "llm_judge grader error: " + describe(e)));
+                    continue;
+                }
                 scores.add(Score.bool(graderSpec.type() + "_error", false, "grader 异常: " + describe(e)));
             }
         }
@@ -335,7 +366,12 @@ public final class EvalMain {
 
     private static void writeArtifactJson(Path file, CaseResult result) throws Exception {
         Files.createDirectories(file.getParent());
+        writeJson(file, buildArtifactJson(result));
+    }
+
+    static ObjectNode buildArtifactJson(CaseResult result) {
         ObjectNode node = MAPPER.valueToTree(result.artifact());
+        node.put("schema_version", ARTIFACT_SCHEMA_VERSION);
         ArrayNode scores = node.putArray("scores");
         for (Score score : result.scores()) {
             ObjectNode scoreNode = scores.addObject();
@@ -345,7 +381,10 @@ public final class EvalMain {
             scoreNode.put("comment", score.comment());
         }
         node.put("task_success", result.taskSuccess());
-        writeJson(file, node);
+        if (result.skipReason() != null) {
+            node.put("skip_reason", result.skipReason());
+        }
+        return node;
     }
 
     private static String projectGitCommit(Path projectRoot) {
@@ -369,6 +408,106 @@ public final class EvalMain {
 
     private static String describe(Exception e) {
         return e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+    }
+
+    static int compareBaseline(Map<String, String> options,
+                               Path projectRoot,
+                               Path evalHome,
+                               Path runDir) {
+        String baselineOption = options.get("baseline");
+        if (baselineOption == null || baselineOption.isBlank()) {
+            return 0;
+        }
+        try {
+            Path baseline = resolvePath(projectRoot, baselineOption);
+            ComparePolicy policy;
+            if (options.containsKey("compare-policy")) {
+                policy = ComparePolicy.load(
+                        resolvePath(projectRoot, options.get("compare-policy")));
+            } else {
+                Path defaultPolicy = evalHome.resolve("baselines").resolve("default-policy.json");
+                policy = Files.isRegularFile(defaultPolicy)
+                        ? ComparePolicy.load(defaultPolicy) : ComparePolicy.defaults();
+            }
+            EvalCompare.ComparisonResult result = EvalCompare.compareFiles(
+                    baseline,
+                    runDir.resolve("report.json"),
+                    policy,
+                    options.get("compare-suite"));
+            EvalCompare.write(runDir, result);
+            System.out.println("Baseline compare: " + (result.passed() ? "PASS" : "FAIL")
+                    + ", report: " + runDir.resolve("compare.md"));
+            return result.passed() ? 0 : 1;
+        } catch (Exception e) {
+            System.err.println("Baseline compare input error: " + describe(e));
+            return 2;
+        }
+    }
+
+    private static Path resolvePath(Path projectRoot, String value) {
+        Path path = Path.of(value);
+        return (path.isAbsolute() ? path : projectRoot.resolve(path)).normalize();
+    }
+
+    private static LlmJudgeGrader.Dependencies createJudgeDependencies(
+            Map<String, String> options, Path projectRoot, Path evalHome) {
+        LlmJudgeGrader.Mode mode =
+                LlmJudgeGrader.Mode.parse(options.getOrDefault("judge-mode", "off"));
+        PaiCliConfig config = PaiCliConfig.load();
+        String provider = firstNonBlank(options.get("judge-provider"),
+                config.getDefaultProvider(), "unknown");
+        String modelOverride = options.get("judge-model");
+        if (modelOverride != null && !modelOverride.isBlank()) {
+            String providerKey = provider.strip().toLowerCase(java.util.Locale.ROOT);
+            PaiCliConfig.ProviderConfig providerConfig = config.getProviders()
+                    .computeIfAbsent(providerKey, ignored -> new PaiCliConfig.ProviderConfig());
+            providerConfig.setModel(modelOverride.strip());
+        }
+
+        LlmClient llmClient = mode == LlmJudgeGrader.Mode.LIVE
+                ? LlmClientFactory.create(provider, config) : null;
+        JudgeClient judgeClient = llmClient == null ? null : new LlmJudgeClient(llmClient);
+        String actualProvider = llmClient == null ? provider : llmClient.getProviderName();
+        String actualModel = llmClient == null
+                ? firstNonBlank(modelOverride, config.getModel(provider), "unknown")
+                : llmClient.getModelName();
+
+        Path cacheRoot = Path.of(options.getOrDefault("judge-cache", "eval/cache/judge"));
+        if (!cacheRoot.isAbsolute()) {
+            cacheRoot = projectRoot.resolve(cacheRoot);
+        }
+        return new LlmJudgeGrader.Dependencies(
+                mode,
+                judgeClient,
+                actualProvider,
+                actualModel,
+                new RubricRepository(evalHome.resolve("rubrics")),
+                new JudgeCache(cacheRoot));
+    }
+
+    private static boolean hasJudge(List<CaseSpec> cases) {
+        return cases.stream().flatMap(c -> c.graders().stream())
+                .anyMatch(g -> "llm_judge".equals(g.type()));
+    }
+
+    private static String judgeRubrics(List<CaseSpec> cases) {
+        return cases.stream()
+                .flatMap(c -> c.graders().stream())
+                .filter(g -> "llm_judge".equals(g.type()))
+                .map(g -> g.text("rubric", "").strip())
+                .filter(s -> !s.isBlank())
+                .distinct()
+                .sorted()
+                .collect(java.util.stream.Collectors.joining(","));
+    }
+
+    private static String firstNonBlank(String... values) {
+        for (String value : values) {
+            if (value != null && !value.isBlank()) {
+                return value.strip();
+            }
+        }
+        return "unknown";
     }
 
     static int effectiveRuns(CaseSpec spec, Integer runsOverride) {
@@ -424,6 +563,13 @@ public final class EvalMain {
                   --runs <n>           覆盖每条 case 的重复次数（pass@3 建议设 3）
                   --max-run-seconds <n> 记录并检查全量运行的总耗时预算
                   --concurrency <n>    并行执行的 case 数（默认 4，设 1 退回串行）
+                  --judge-mode <mode>  off / cache-only / live (default off)
+                  --judge-provider <p> judge provider (defaults to PaiCLI provider)
+                  --judge-model <m>    override judge model
+                  --judge-cache <dir>  judge cache directory (default eval/cache/judge)
+                  --baseline <report>  compare this run against a baseline report.json
+                  --compare-policy <p> comparison policy JSON
+                  --compare-suite <s>  compare only one suite
                   --keep-workspace     保留工作区现场用于排查（safety 用例排查时建议开）
                   --help               显示本帮助
                 """);

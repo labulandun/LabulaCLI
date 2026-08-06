@@ -59,5 +59,19 @@ java -cp target/paicli-1.0-SNAPSHOT.jar com.paicli.eval.EvalMain --suite termina
 ```
 
 - 2026-08-03 本机 Docker 29.2.1 全量验收：15 case × 3 runs 全部执行、0 skipped，43/45 run 通过；pass@1=14/15（0.9333），pass@3=15/15（1.0000），总耗时 688.758 秒（约 11 分 29 秒）
-- 当前边界：E3/E4 Docker 仅服务评测 harness，不是产品运行时沙箱；LLM judge 与回归门禁属于 Phase E5
+- 当前边界：E3/E4 Docker 仅服务评测 harness，不是产品运行时沙箱。
+
+### 评测体系 Phase E5 第一批（契约 + Judge + Baseline Compare）
+
+- 固定 E1–E4 工件契约：`artifact.json` / `report.json` 写入 `schema_version=1`，skip 也必须落独立 artifact；`task_success` 至少需要一个 BOOLEAN 断言，NUMERIC-only 结果不能误判通过
+- 新增非门禁 `llm_judge` grader 与 `code-quality-v1` / `answer-quality-v1` rubric；支持 `off`（默认）/ `cache-only` / `live`，严格解析 1–5 分 JSON，缓存只保存判分结果而不保存 task/answer/diff prompt
+- 官方 E1–E4 suite 暂不声明 `llm_judge`，避免默认计费和历史基线漂移；自定义 case 可在 `graders` 中显式添加 `{ "type": "llm_judge", "rubric": "code-quality-v1" }`，再传 `--judge-mode live`
+- 新增 `EvalCompare`：默认要求 case/run 集合一致、已执行覆盖不退化、pass_rate 最多下降 0.05、token 中位数最多增至 1.30 倍、`guard_block_rate` 不低于 1.0；严格策略契约使用 `schema_version=1`，默认文件位于 `eval/baselines/default-policy.json`
+
+```bash
+java -cp target/paicli-1.0-SNAPSHOT.jar com.paicli.eval.EvalMain --suite custom --baseline eval/baselines/accepted-report.json --compare-policy eval/baselines/default-policy.json
+java -cp target/paicli-1.0-SNAPSHOT.jar com.paicli.eval.EvalCompare --baseline eval/baselines/accepted-report.json --candidate eval/runs/<run-id>/report.json --out eval/runs/<run-id>/compare
+```
+
+- `EvalCompare` 返回码：0=通过、1=发现回归、2=输入/契约错误；Langfuse、Maven CI、线上 20 样本 Judge 校准、全量验收和 SOP 暂缓
 

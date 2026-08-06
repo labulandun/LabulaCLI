@@ -50,6 +50,7 @@ class ReporterTest {
                 CaseResult.skipped(spec("c3"), "sandbox docker 未支持"));
         ObjectNode report = Reporter.buildJson(meta, results);
 
+        assertEquals(Reporter.REPORT_SCHEMA_VERSION, report.path("schema_version").asInt());
         assertEquals(3, report.path("summary").path("total").asInt());
         assertEquals(2, report.path("summary").path("executed").asInt());
         assertEquals(1, report.path("summary").path("skipped").asInt());
@@ -59,6 +60,7 @@ class ReporterTest {
         assertEquals("trace-1", report.path("cases").get(0).path("trace_id").asText());
         assertTrue(report.path("cases").get(2).path("skip_reason").asText().contains("docker"));
         assertEquals(1200, report.path("summary").path("tokens_total").asLong());
+        assertEquals(600, report.path("summary").path("tokens_median").asLong());
         assertEquals(2, report.path("summary").path("tool_calls").asInt());
         assertEquals(0.5, report.path("summary").path("tool_error_rate").asDouble());
         assertEquals(1200, report.path("cases").get(0).path("tokens_total").asLong());
@@ -74,6 +76,9 @@ class ReporterTest {
 
         RunArtifact completed = EvalFixtures.artifact("c2", "completed", "ok");
         assertFalse(CaseResult.of(spec("c2"), 1, completed, List.of()).taskSuccess());
+        assertFalse(CaseResult.of(spec("c2"), 1, completed,
+                List.of(new Score("judge_score", 5, Score.DataType.NUMERIC, "excellent")))
+                .taskSuccess());
     }
 
     @Test

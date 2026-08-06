@@ -16,6 +16,7 @@ import java.util.Map;
 /** 输出 run 级 report.json（机器可 diff）与 report.md（人读摘要）。 */
 public final class Reporter {
 
+    static final int REPORT_SCHEMA_VERSION = 1;
     private static final ObjectMapper MAPPER = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
 
     private Reporter() {
@@ -30,6 +31,7 @@ public final class Reporter {
 
     static ObjectNode buildJson(Map<String, String> runMeta, List<CaseResult> results) {
         ObjectNode root = MAPPER.createObjectNode();
+        root.put("schema_version", REPORT_SCHEMA_VERSION);
         ObjectNode run = root.putObject("run");
         runMeta.forEach(run::put);
 
@@ -45,6 +47,10 @@ public final class Reporter {
                 : (long) executed.stream().mapToLong(r -> r.artifact().wallTimeMs()).average().orElse(0));
         summary.put("tokens_total", executed.stream()
                 .mapToLong(r -> r.artifact().llm().totalTokens()).sum());
+        summary.put("tokens_median", medianLong(executed.stream()
+                .mapToLong(r -> r.artifact().llm().totalTokens())
+                .sorted()
+                .toArray()));
         long toolCalls = executed.stream().mapToLong(r -> r.artifact().tools().size()).sum();
         long toolErrors = executed.stream().mapToLong(r -> r.artifact().toolErrors()).sum();
         summary.put("tool_calls", toolCalls);
@@ -405,5 +411,16 @@ public final class Reporter {
 
     private static double round4(double value) {
         return Math.round(value * 10000.0) / 10000.0;
+    }
+
+    private static long medianLong(long[] sorted) {
+        if (sorted.length == 0) {
+            return 0;
+        }
+        int middle = sorted.length / 2;
+        if (sorted.length % 2 == 1) {
+            return sorted[middle];
+        }
+        return Math.round((sorted[middle - 1] + sorted[middle]) / 2.0);
     }
 }

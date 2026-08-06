@@ -21,4 +21,6 @@ target/
 Thumbs.db
 
 # 评测运行输出（工作区/工件/报告，只提交 eval/suites 与 eval/baselines）
+# LLM judge content-addressed cache
+eval/cache/
 eval/runs/
