@@ -2,6 +2,8 @@ package com.paicli.tool;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.paicli.runtime.CancellationContext;
+import com.paicli.runtime.CancellationToken;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -38,21 +40,32 @@ final class RipgrepCodeSearchEngine implements CodeSearchEngine {
 
         Process process = null;
         ExecutorService readerExecutor = null;
+        CancellationToken.Registration cancellationRegistration = CancellationToken.Registration.NO_OP;
         try {
             ProcessBuilder pb = new ProcessBuilder(command(request));
             pb.directory(request.projectRoot().toFile());
             pb.redirectErrorStream(true);
             process = pb.start();
+            Process runningProcess = process;
+            CancellationToken token = CancellationContext.current();
+            cancellationRegistration = token == null
+                    ? CancellationToken.Registration.NO_OP
+                    : token.onCancel(runningProcess::destroyForcibly);
 
             readerExecutor = Executors.newSingleThreadExecutor(r -> {
                 Thread thread = new Thread(r, "paicli-rg-reader");
                 thread.setDaemon(true);
                 return thread;
             });
-            Process runningProcess = process;
             Future<ParsedRipgrepOutput> outputFuture = readerExecutor.submit(
                     () -> parseOutput(runningProcess.getInputStream(), runningProcess, request));
-            boolean finished = process.waitFor(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+            long timeoutMillis = CancellationContext.remainingMillis(TIMEOUT.toMillis(), 0);
+            if (timeoutMillis <= 0) {
+                process.destroyForcibly();
+                outputFuture.cancel(true);
+                return new CodeSearchResult("rg", List.of(), true, "rg 搜索已取消或超过 Deadline");
+            }
+            boolean finished = process.waitFor(timeoutMillis, TimeUnit.MILLISECONDS);
             if (!finished) {
                 process.destroyForcibly();
                 outputFuture.cancel(true);
@@ -71,8 +84,12 @@ final class RipgrepCodeSearchEngine implements CodeSearchEngine {
             if (process != null) {
                 process.destroyForcibly();
             }
+            if (CancellationContext.isCancelled() || Thread.currentThread().isInterrupted()) {
+                return new CodeSearchResult("rg", List.of(), true, "rg 搜索已取消或超过 Deadline");
+            }
             return fallback(request);
         } finally {
+            cancellationRegistration.close();
             if (readerExecutor != null) {
                 readerExecutor.shutdownNow();
             }
@@ -185,12 +202,23 @@ final class RipgrepCodeSearchEngine implements CodeSearchEngine {
     private boolean isRipgrepAvailable() {
         try {
             Process process = new ProcessBuilder("rg", "--version").start();
-            boolean finished = process.waitFor(2, TimeUnit.SECONDS);
-            if (!finished) {
-                process.destroyForcibly();
-                return false;
+            CancellationToken token = CancellationContext.current();
+            CancellationToken.Registration registration = token == null
+                    ? CancellationToken.Registration.NO_OP
+                    : token.onCancel(process::destroyForcibly);
+            try (registration) {
+                long timeoutMillis = CancellationContext.remainingMillis(2_000, 0);
+                if (timeoutMillis <= 0) {
+                    process.destroyForcibly();
+                    return false;
+                }
+                boolean finished = process.waitFor(timeoutMillis, TimeUnit.MILLISECONDS);
+                if (!finished) {
+                    process.destroyForcibly();
+                    return false;
+                }
+                return process.exitValue() == 0;
             }
-            return process.exitValue() == 0;
         } catch (IOException | InterruptedException e) {
             if (e instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
@@ -200,6 +228,9 @@ final class RipgrepCodeSearchEngine implements CodeSearchEngine {
     }
 
     private CodeSearchResult fallback(CodeSearchRequest request) {
+        if (CancellationContext.isCancelled()) {
+            return new CodeSearchResult("java", List.of(), true, "Java 搜索已取消或超过 Deadline");
+        }
         return new JavaCodeSearchEngine(excludedDirs).search(request);
     }
 

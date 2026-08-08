@@ -4,40 +4,40 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.paicli.runtime.CancellationContext;
+import com.paicli.runtime.CancellationToken;
+import com.paicli.runtime.ResilienceConfig;
 import okhttp3.*;
 import okio.BufferedSource;
 
 import java.io.IOException;
+import java.io.InterruptedIOException;
+import java.net.SocketTimeoutException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
 
     protected static final ObjectMapper mapper = new ObjectMapper();
 
-    // SSE 流式接口下，OkHttp 的 readTimeout 是"两次 read 之间的最大间隔"，不是请求总时长。
-    // GLM-5.1 在生成大段 reasoning_content 时服务端可能长时间静默，所以默认值放宽到 300s；
-    // callTimeout 作为整体兜底，覆盖极端情况下的连接半死状态。
-    // 三项均可通过系统属性覆盖，便于不同模型 / 网络环境调优。
-    protected static final OkHttpClient SHARED_HTTP_CLIENT = new OkHttpClient.Builder()
-            .connectTimeout(readTimeoutSeconds("paicli.llm.connect.timeout.seconds", 60), TimeUnit.SECONDS)
-            .readTimeout(readTimeoutSeconds("paicli.llm.read.timeout.seconds", 300), TimeUnit.SECONDS)
-            .writeTimeout(readTimeoutSeconds("paicli.llm.write.timeout.seconds", 60), TimeUnit.SECONDS)
-            .callTimeout(readTimeoutSeconds("paicli.llm.call.timeout.seconds", 600), TimeUnit.SECONDS)
-            .build();
+    // The builder created per attempt narrows these configured caps with the current run deadline.
+    // newBuilder() keeps the shared dispatcher/connection pool while allowing per-call budgets.
+    protected static final OkHttpClient SHARED_HTTP_CLIENT = new OkHttpClient.Builder().build();
+    private static final ScheduledThreadPoolExecutor FIRST_TOKEN_WATCHDOG = createFirstTokenWatchdog();
 
-    private static long readTimeoutSeconds(String key, long defaultValue) {
-        String raw = System.getProperty(key);
-        if (raw == null || raw.isBlank()) {
-            return defaultValue;
-        }
-        try {
-            long parsed = Long.parseLong(raw.trim());
-            return parsed > 0 ? parsed : defaultValue;
-        } catch (NumberFormatException e) {
-            return defaultValue;
-        }
+    private static ScheduledThreadPoolExecutor createFirstTokenWatchdog() {
+        ScheduledThreadPoolExecutor scheduler = new ScheduledThreadPoolExecutor(1, r -> {
+                Thread thread = new Thread(r, "paicli-llm-first-token-timeout");
+                thread.setDaemon(true);
+                return thread;
+            });
+        scheduler.setRemoveOnCancelPolicy(true);
+        return scheduler;
     }
 
     protected abstract String getApiUrl();
@@ -58,6 +58,24 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
     @Override
     public ChatResponse chat(List<Message> messages, List<Tool> tools, StreamListener listener) throws IOException {
         StreamListener streamListener = listener == null ? StreamListener.NO_OP : listener;
+        AtomicBoolean streamedOutput = new AtomicBoolean(false);
+        StreamListener trackingListener = new StreamListener() {
+            @Override
+            public void onReasoningDelta(String delta) {
+                if (delta != null && !delta.isEmpty()) {
+                    streamedOutput.set(true);
+                }
+                streamListener.onReasoningDelta(delta);
+            }
+
+            @Override
+            public void onContentDelta(String delta) {
+                if (delta != null && !delta.isEmpty()) {
+                    streamedOutput.set(true);
+                }
+                streamListener.onContentDelta(delta);
+            }
+        };
         RequestBody body = RequestBody.create(
                 buildRequestBody(messages, tools).toString(),
                 MediaType.parse("application/json")
@@ -70,11 +88,58 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
                 .post(body)
                 .build();
 
-        try (Response response = SHARED_HTTP_CLIENT.newCall(request).execute()) {
+        String circuitKey = getProviderName() + "|" + getModelName() + "|" + circuitEndpoint(getApiUrl());
+        return LlmResilience.execute(circuitKey, streamedOutput::get,
+                attempt -> executeAttempt(request, trackingListener, streamedOutput));
+    }
+
+    private ChatResponse executeAttempt(Request request, StreamListener streamListener,
+                                        AtomicBoolean streamedOutput) throws IOException {
+        ResilienceConfig config = ResilienceConfig.current();
+        long configuredCap = Math.min(config.llmAttemptTimeoutMillis(), config.llmCallTimeoutMillis());
+        long attemptBudget = CancellationContext.remainingMillis(
+                configuredCap, config.finalizationReserveMillis());
+        if (attemptBudget <= 0) {
+            throw new LlmTimeoutException("run", "Agent 剩余 Deadline 不足以启动 LLM 调用");
+        }
+
+        OkHttpClient attemptClient = SHARED_HTTP_CLIENT.newBuilder()
+                .connectTimeout(Math.max(1, Math.min(config.llmConnectTimeoutMillis(), attemptBudget)),
+                        TimeUnit.MILLISECONDS)
+                .readTimeout(Math.max(1, Math.min(config.llmReadTimeoutMillis(), attemptBudget)),
+                        TimeUnit.MILLISECONDS)
+                .writeTimeout(Math.max(1, Math.min(config.llmWriteTimeoutMillis(), attemptBudget)),
+                        TimeUnit.MILLISECONDS)
+                .callTimeout(Math.max(1, attemptBudget), TimeUnit.MILLISECONDS)
+                .build();
+
+        Call call = attemptClient.newCall(request);
+        CancellationToken token = CancellationContext.current();
+        CancellationToken.Registration cancellationRegistration = token == null
+                ? CancellationToken.Registration.NO_OP
+                : token.onCancel(call::cancel);
+        AtomicReference<String> forcedTimeoutPhase = new AtomicReference<>();
+        AtomicReference<ScheduledFuture<?>> firstTokenTask = new AtomicReference<>();
+        long firstTokenBudget = Math.max(1, Math.min(config.llmFirstTokenTimeoutMillis(), attemptBudget));
+        firstTokenTask.set(FIRST_TOKEN_WATCHDOG.schedule(() -> {
+            forcedTimeoutPhase.compareAndSet(null, "first_token");
+            call.cancel();
+        }, firstTokenBudget, TimeUnit.MILLISECONDS));
+
+        Runnable markFirstEvent = () -> {
+            ScheduledFuture<?> task = firstTokenTask.getAndSet(null);
+            if (task != null) {
+                task.cancel(false);
+            }
+        };
+
+        try (Response response = call.execute()) {
             ResponseBody responseBodyObj = response.body();
             if (!response.isSuccessful()) {
                 String errorBody = responseBodyObj != null ? responseBodyObj.string() : "无响应体";
-                throw new IOException("API请求失败: " + response.code() + " - " + errorBody);
+                throw new LlmHttpException(response.code(),
+                        "API请求失败: " + response.code() + " - " + truncate(errorBody, 2_000),
+                        retryAfterMillis(response.header("Retry-After")));
             }
             if (responseBodyObj == null) {
                 throw new IOException("API返回空响应体");
@@ -90,6 +155,7 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
             int cachedInputTokens = 0;
 
             while (!source.exhausted()) {
+                ensureNotCancelled();
                 String line = source.readUtf8Line();
                 if (line == null) {
                     break;
@@ -105,6 +171,7 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
                     continue;
                 }
                 if ("[DONE]".equals(payload)) {
+                    markFirstEvent.run();
                     break;
                 }
 
@@ -130,6 +197,16 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
                     continue;
                 }
 
+                JsonNode toolCallDeltas = delta.path("tool_calls");
+                if (!extractReasoningDelta(delta).isEmpty()
+                        || !delta.path("content").asText("").isEmpty()
+                        || (toolCallDeltas.isArray() && !toolCallDeltas.isEmpty())) {
+                    markFirstEvent.run();
+                }
+                if (toolCallDeltas.isArray() && !toolCallDeltas.isEmpty()) {
+                    streamedOutput.set(true);
+                }
+
                 String deltaRole = delta.path("role").asText("");
                 if (!deltaRole.isEmpty()) {
                     role = deltaRole;
@@ -147,7 +224,7 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
                     streamListener.onContentDelta(contentDelta);
                 }
 
-                mergeToolCallDeltas(toolAccumulators, delta.path("tool_calls"));
+                mergeToolCallDeltas(toolAccumulators, toolCallDeltas);
             }
 
             return new ChatResponse(
@@ -159,7 +236,79 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
                     outputTokens,
                     cachedInputTokens
             );
+        } catch (LlmHttpException | LlmTimeoutException | LlmCancelledException e) {
+            throw e;
+        } catch (IOException e) {
+            if (token != null && token.isCancelled()) {
+                if (token.isDeadlineExceeded()) {
+                    throw new LlmTimeoutException("run", "Agent 全链路 Deadline 已耗尽", e);
+                }
+                throw new LlmCancelledException("LLM 调用已主动取消", e);
+            }
+            String forcedPhase = forcedTimeoutPhase.get();
+            if (forcedPhase != null) {
+                throw new LlmTimeoutException(forcedPhase,
+                        "LLM 首 Token 等待超过 " + firstTokenBudget + "ms", e);
+            }
+            if (e instanceof SocketTimeoutException) {
+                throw new LlmTimeoutException("stream_idle", "LLM 流式响应静默超时", e);
+            }
+            if (e instanceof InterruptedIOException
+                    && e.getMessage() != null
+                    && e.getMessage().toLowerCase().contains("timeout")) {
+                throw new LlmTimeoutException("attempt", "LLM 单次调用超时", e);
+            }
+            throw e;
+        } finally {
+            markFirstEvent.run();
+            cancellationRegistration.close();
+            call.cancel();
         }
+    }
+
+    private static String circuitEndpoint(String url) {
+        if (url == null) {
+            return "";
+        }
+        int query = url.indexOf('?');
+        int fragment = url.indexOf('#');
+        int end = url.length();
+        if (query >= 0) {
+            end = Math.min(end, query);
+        }
+        if (fragment >= 0) {
+            end = Math.min(end, fragment);
+        }
+        return url.substring(0, end);
+    }
+
+    private static void ensureNotCancelled() throws IOException {
+        CancellationToken token = CancellationContext.current();
+        if (token == null || !token.isCancelled()) {
+            return;
+        }
+        if (token.isDeadlineExceeded()) {
+            throw new LlmTimeoutException("run", "Agent 全链路 Deadline 已耗尽");
+        }
+        throw new LlmCancelledException("LLM 调用已取消", null);
+    }
+
+    private static long retryAfterMillis(String value) {
+        if (value == null || value.isBlank()) {
+            return 0;
+        }
+        try {
+            return Math.multiplyExact(Long.parseLong(value.trim()), 1_000L);
+        } catch (NumberFormatException | ArithmeticException ignored) {
+            return 0;
+        }
+    }
+
+    private static String truncate(String value, int maxChars) {
+        if (value == null || value.length() <= maxChars) {
+            return value;
+        }
+        return value.substring(0, maxChars) + "...";
     }
 
     private String extractReasoningDelta(JsonNode delta) {

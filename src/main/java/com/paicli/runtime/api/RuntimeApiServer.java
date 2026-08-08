@@ -3,6 +3,8 @@ package com.paicli.runtime.api;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.paicli.observability.PaiCliTracing;
+import com.paicli.runtime.CancellationContext;
+import com.paicli.runtime.CancellationToken;
 import com.paicli.runtime.task.TaskRunner;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
@@ -13,6 +15,8 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Optional;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.function.Supplier;
@@ -24,6 +28,7 @@ public class RuntimeApiServer implements AutoCloseable {
     private final String apiKey;
     private final Supplier<Optional<PaiCliTracing.TraceReference>> traceReferenceSupplier;
     private final HttpServer server;
+    private final Map<String, CancellationToken> runningTurns = new ConcurrentHashMap<>();
     private final ExecutorService executor = Executors.newCachedThreadPool(r -> {
         Thread thread = new Thread(r, "paicli-runtime-api");
         thread.setDaemon(true);
@@ -128,18 +133,44 @@ public class RuntimeApiServer implements AutoCloseable {
     }
 
     private void runTurn(String threadId, String turnId, String input) {
+        CancellationToken token = CancellationContext.startRun();
+        runningTurns.put(turnId, token);
         try {
-            String result = runner.run(input);
-            store.appendEvent(threadId, "message.delta",
-                    "{\"turn_id\":\"" + turnId + "\",\"content\":\"" + escape(result) + "\"}");
-            PaiCliTracing.TraceReference traceReference = takeTraceReference();
-            store.appendEvent(threadId, "turn.completed",
-                    "{\"turn_id\":\"" + turnId + "\",\"status\":\"completed\"" + traceFields(traceReference) + "}");
+            try (CancellationContext.Scope ignored = CancellationContext.bind(token)) {
+                String result = runner.run(input);
+                if (token.isCancelled()) {
+                    boolean timedOut = token.isDeadlineExceeded();
+                    PaiCliTracing.TraceReference traceReference = takeTraceReference();
+                    store.appendEvent(threadId, "turn.failed",
+                            "{\"turn_id\":\"" + turnId + "\",\"status\":\""
+                                    + (timedOut ? "timeout" : "canceled") + "\","
+                                    + "\"error\":\"" + (timedOut
+                                    ? "Agent 全链路 Deadline 已耗尽" : "Agent 运行已取消") + "\""
+                                    + traceFields(traceReference) + "}");
+                    return;
+                }
+                store.appendEvent(threadId, "message.delta",
+                        "{\"turn_id\":\"" + turnId + "\",\"content\":\"" + escape(result) + "\"}");
+                PaiCliTracing.TraceReference traceReference = takeTraceReference();
+                store.appendEvent(threadId, "turn.completed",
+                        "{\"turn_id\":\"" + turnId + "\",\"status\":\"completed\""
+                                + traceFields(traceReference) + "}");
+            }
         } catch (Exception e) {
             PaiCliTracing.TraceReference traceReference = takeTraceReference();
+            String status = token.isDeadlineExceeded()
+                    ? "timeout"
+                    : token.isCancelled() ? "canceled" : "failed";
             store.appendEvent(threadId, "turn.failed",
-                    "{\"turn_id\":\"" + turnId + "\",\"error\":\"" + escape(e.getMessage()) + "\""
+                    "{\"turn_id\":\"" + turnId + "\",\"status\":\"" + status
+                            + "\",\"error\":\"" + escape(e.getMessage()) + "\""
                             + traceFields(traceReference) + "}");
+        } finally {
+            runningTurns.remove(turnId, token);
+            CancellationContext.clear(token);
+            if (Thread.currentThread().isInterrupted()) {
+                Thread.interrupted();
+            }
         }
     }
 
@@ -234,6 +265,7 @@ public class RuntimeApiServer implements AutoCloseable {
     @Override
     public void close() {
         server.stop(0);
+        runningTurns.values().forEach(CancellationToken::cancel);
         executor.shutdownNow();
     }
 }

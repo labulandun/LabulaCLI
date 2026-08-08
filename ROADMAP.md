@@ -255,7 +255,7 @@
   - `resources/list_changed` / `resources/updated` → cache 失效
   - **不做 health ping**，不主动探活，避免对按量或按月计费 server 造成额外负担
 - **新增 CLI**：`/mcp resources <server>`、`/mcp prompts <server>`
-- **运行中取消**：任务执行期间输入 `/cancel` 并回车，请求取消当前 Agent run；ReAct、Plan、Team、工具批次与 `execute_command` 在边界处协同检查取消信号
+- **运行中取消**：任务执行期间输入 `/cancel` 并回车，请求取消当前 Agent run；ReAct、Plan、Team、工具和 MCP 共享 Deadline/取消信号，在途 LLM/HTTP MCP Call、命令进程与子 Future 会主动终止，pending MCP request 会发送 `notifications/cancelled`
 
 **不做（明确边界）**：
 - OAuth 2.0 Authorization Code + PKCE
@@ -522,7 +522,7 @@
 
 **后台任务（Task Manager）**：
 - `DurableTaskManager`：SQLite 持久化的任务队列，复用已有的 `VectorStore` SQLite 基础设施
-- 任务生命周期：`enqueued` → `running` → `completed` / `failed` / `canceled`
+- 任务生命周期：`enqueued` → `running` → `completed` / `failed` / `timed_out` / `canceled`
 - Worker Pool：可配并发数（默认 2），每个 Worker 启动独立 Agent 线程执行任务
 - `/task add <prompt>`：提交后台任务，返回 task_id
 - `/task list`：列出所有任务（含状态、耗时、进度）

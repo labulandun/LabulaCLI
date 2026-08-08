@@ -887,7 +887,7 @@ public class Main {
             thread.setDaemon(true);
             return thread;
         });
-        Future<String> future = executor.submit(task);
+        Future<String> future = executor.submit(CancellationContext.wrap(task));
         // 进入 raw mode 监听 ESC：raw mode 关 ICANON / ECHO / IEXTEN 但保留 ISIG，所以 Ctrl+C 仍能终止 PaiCLI。
         Attributes original = null;
         try {
@@ -899,6 +899,11 @@ public class Main {
                 }
             }
             while (!future.isDone()) {
+                if (token.isCancelled()) {
+                    future.cancel(true);
+                    executor.shutdownNow();
+                    return CancellationContext.stopMessage("当前任务");
+                }
                 if (original != null && readEscCancel(terminal)) {
                     token.cancel();
                     future.cancel(true);

@@ -43,11 +43,24 @@ For the primary entry point, see `/AGENTS.md`.
 
 设计取舍：长上下文模型默认不再以 80% x window 为硬限。死循环防护由 stagnation 检测（连续 3 轮相同工具调用）和 hardMaxIterations（50 轮）兜底。Token 显示行 `📊 Token: 已用 X / Y` 的 Y 是软提示，不代表强制限制。
 
-### LLM HTTP Timeout Config
+### Runtime Deadline + LLM Resilience Config
 
-系统属性 > 默认值：`paicli.llm.connect.timeout.seconds`(60) / `paicli.llm.read.timeout.seconds`(300) / `paicli.llm.write.timeout.seconds`(60) / `paicli.llm.call.timeout.seconds`(600)
+读取顺序统一为系统属性 > 环境变量 > 进程当前工作目录 `.env` > 用户 `~/.env` > 默认值；配置在进程内首次加载后保持不变，CLI `/cd` 不会重新加载这些值。
 
-SSE 流式下 readTimeout 是两次 read 间最大间隔，GLM-5.1 生成大段 reasoning 时可能长时间静默，所以放宽到 300 秒。
+| 行为 | 系统属性 / 环境变量 | 默认值 |
+|------|---------------------|--------|
+| 根 Agent Deadline | `paicli.agent.deadline.seconds` / `PAICLI_AGENT_DEADLINE_SECONDS` | 600s |
+| Plan/Team 单步上限 | `paicli.agent.step.deadline.seconds` / `PAICLI_AGENT_STEP_DEADLINE_SECONDS` | 180s |
+| 收尾预留 | `paicli.agent.finalization.reserve.seconds` / `PAICLI_AGENT_FINALIZATION_RESERVE_SECONDS` | 5s |
+| LLM 单次尝试 / 首 token | `paicli.llm.attempt.timeout.seconds` / `PAICLI_LLM_ATTEMPT_TIMEOUT_SECONDS`; `paicli.llm.first.token.timeout.seconds` / `PAICLI_LLM_FIRST_TOKEN_TIMEOUT_SECONDS` | 180s / 60s |
+| HTTP connect/read/write/call | `paicli.llm.connect.timeout.seconds` / `PAICLI_LLM_CONNECT_TIMEOUT_SECONDS`; `paicli.llm.read.timeout.seconds` / `PAICLI_LLM_READ_TIMEOUT_SECONDS`; `paicli.llm.write.timeout.seconds` / `PAICLI_LLM_WRITE_TIMEOUT_SECONDS`; `paicli.llm.call.timeout.seconds` / `PAICLI_LLM_CALL_TIMEOUT_SECONDS` | 60s / 300s / 60s / 600s |
+| 最大重试 / 退避 | `paicli.llm.max.retries` / `PAICLI_LLM_MAX_RETRIES`; `paicli.llm.retry.base.delay.millis` / `PAICLI_LLM_RETRY_BASE_DELAY_MILLIS`; `paicli.llm.retry.max.delay.millis` / `PAICLI_LLM_RETRY_MAX_DELAY_MILLIS` | 1 / 250ms / 2000ms |
+| 熔断开关 / 阈值 | `paicli.llm.circuit.enabled` / `PAICLI_LLM_CIRCUIT_ENABLED`; `paicli.llm.circuit.failure.threshold` / `PAICLI_LLM_CIRCUIT_FAILURE_THRESHOLD` | true / 3 |
+| 熔断窗口 / OPEN 冷却 / HALF_OPEN 并发探针 | `paicli.llm.circuit.window.seconds` / `PAICLI_LLM_CIRCUIT_WINDOW_SECONDS`; `paicli.llm.circuit.open.seconds` / `PAICLI_LLM_CIRCUIT_OPEN_SECONDS`; `paicli.llm.circuit.half.open.probes` / `PAICLI_LLM_CIRCUIT_HALF_OPEN_PROBES` | 60s / 30s / 1 |
+
+根任务使用单调时钟绝对 Deadline；Plan/Team step、LLM attempt、工具/MCP 都取父级剩余预算与自身上限的较小值。SSE `readTimeout` 是两次 read 的最大静默间隔，`first-token timeout` 与 `call timeout` 分别约束首次有效增量和整次调用。Deadline/取消会主动取消 OkHttp Call、命令进程和子 Future。
+
+LLM 仅在尚未收到 reasoning/content/tool-call 流式增量时，对连接/EOF/Socket 超时、408、429、5xx 等瞬时错误重试；退避和 `Retry-After` 必须落在剩余预算内。最大重试配置限制为 0–3，熔断阈值限制为 1–100，HALF_OPEN 探针限制为 1–16。熔断按 `provider + model + endpoint` 维护 CLOSED/OPEN/HALF_OPEN 状态，OPEN 时快速失败；当前没有自动 Provider failover。
 
 ### Web Search Provider Config
 
@@ -105,7 +118,7 @@ scheme 白名单(http/https) / 主机黑名单(localhost/loopback/link-local/sit
 
 - 三角色：Planner / Worker(默认 2 个) / Reviewer
 - 流程：规划 → 按依赖分配 Worker → Reviewer 审查 → 未通过重试(最多 2 次)
-- SubAgent IOException 返回 ERROR 类型
+- SubAgent 将 LLM timeout / canceled / IOException 分别转成可区分的 ERROR 消息
 - 所有子代理共享 ToolRegistry 和 MemoryManager
 
 ### HITL System
@@ -202,8 +215,10 @@ scheme 白名单(http/https) / 主机黑名单(localhost/loopback/link-local/sit
 ### Async Tasks + Runtime API (Phase 20)
 
 - DurableTaskManager(SQLite) / CLI: /task, /task list, /task add, /task cancel, /task log
+- Durable Task 终态区分 `completed` / `failed` / `timed_out` / `canceled`；取消与 Deadline 会先触发底层资源取消，再持久化终态
 - Runtime API: `serve --http --port 8080`，仅 127.0.0.1，需 API Key
 - 端点：POST /v1/threads / POST /v1/threads/{id}/turns / GET /v1/threads/{id}/events
+- Runtime turn 使用同一产品 Deadline，失败事件的 `status` 区分 `timeout` / `canceled` / `failed`
 
 ### Image Input (Phase 21)
 

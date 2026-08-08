@@ -3,6 +3,8 @@ package com.paicli.agent;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.paicli.llm.LlmClient;
+import com.paicli.llm.LlmCancelledException;
+import com.paicli.llm.LlmTimeoutException;
 import com.paicli.llm.LlmTraceLogger;
 import com.paicli.lsp.LspDiagnosticReport;
 import com.paicli.memory.ConversationHistoryCompactor;
@@ -10,6 +12,7 @@ import com.paicli.context.ContextProfile;
 import com.paicli.prompt.PromptAssembler;
 import com.paicli.prompt.PromptContext;
 import com.paicli.prompt.PromptMode;
+import com.paicli.runtime.CancellationContext;
 import com.paicli.skill.SkillContextBuffer;
 import com.paicli.skill.SkillIndexFormatter;
 import com.paicli.skill.SkillRegistry;
@@ -159,6 +162,12 @@ public class SubAgent {
      * 避免多个 Agent 同时写入 System.out 造成输出交错。
      */
     public AgentMessage execute(AgentMessage task, PrintStream out) {
+        try (CancellationContext.RunLease ignored = CancellationContext.openRun()) {
+            return executeWithinContext(task, out);
+        }
+    }
+
+    private AgentMessage executeWithinContext(AgentMessage task, PrintStream out) {
         log.info("[{}] executing task from {}: type={}", name, task.fromAgent(), task.type());
         pruneHistoricalImagePayloads();
         refreshSystemPrompt();
@@ -175,6 +184,10 @@ public class SubAgent {
 
         // 与 Agent.java 对称：主退出条件 = LLM 自决，budget 仅在 token / 停滞 / 硬轮数兜底。
         while (true) {
+            if (CancellationContext.isCancelled()) {
+                streamRenderer.finish();
+                return AgentMessage.error(name, role, CancellationContext.stopMessage("当前子 Agent 任务"));
+            }
             AgentBudget.ExitReason exitReason = budget.check();
             if (exitReason != AgentBudget.ExitReason.WITHIN_BUDGET) {
                 streamRenderer.finish();
@@ -201,6 +214,11 @@ public class SubAgent {
                         "sub-agent name=" + name + " role=" + role + " iteration=" + budget.iteration(),
                         llmClient,
                         response.reasoningContent());
+
+                if (CancellationContext.isCancelled()) {
+                    streamRenderer.finish();
+                    return AgentMessage.error(name, role, CancellationContext.stopMessage("当前子 Agent 任务"));
+                }
 
                 budget.recordTokens(response.inputTokens(), response.outputTokens(), response.cachedInputTokens());
 
@@ -232,6 +250,14 @@ public class SubAgent {
 
                 return AgentMessage.result(name, role, response.content());
 
+            } catch (LlmTimeoutException e) {
+                log.warn("[{}] LLM call timed out: phase={}", name, e.phase());
+                streamRenderer.finish();
+                return AgentMessage.error(name, role,
+                        "LLM 调用超时（" + e.phase() + "）: " + e.getMessage());
+            } catch (LlmCancelledException e) {
+                streamRenderer.finish();
+                return AgentMessage.error(name, role, "LLM 调用已取消");
             } catch (IOException e) {
                 log.error("[{}] LLM call failed", name, e);
                 streamRenderer.finish();

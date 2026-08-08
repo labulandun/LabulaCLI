@@ -195,6 +195,12 @@ public class ExecutionPlan {
         this.endTime = System.currentTimeMillis();
     }
 
+    /** 标记为用户主动取消，与执行失败分开。 */
+    public void markCancelled() {
+        this.status = PlanStatus.CANCELLED;
+        this.endTime = System.currentTimeMillis();
+    }
+
     /**
      * 获取总耗时
      */

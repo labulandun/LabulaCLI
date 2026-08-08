@@ -1,6 +1,8 @@
 package com.paicli.agent;
 
 import com.paicli.llm.LlmClient;
+import com.paicli.llm.LlmCancelledException;
+import com.paicli.llm.LlmTimeoutException;
 import com.paicli.llm.LlmTraceLogger;
 import com.paicli.context.ContextProfile;
 import com.paicli.context.TokenUsageFormatter;
@@ -200,7 +202,8 @@ public class Agent {
     }
 
     private String run(String userInput, boolean returnStreamedContent) {
-        try (PaiCliTracing.AgentRun traceRun = tracing.startAgentRun(
+        try (CancellationContext.RunLease ignored = CancellationContext.openRun();
+             PaiCliTracing.AgentRun traceRun = tracing.startAgentRun(
                 userInput, llmClient.getProviderName(), llmClient.getModelName(), traceSessionId)) {
             try {
                 String result = runTraced(userInput, traceRun, returnStreamedContent);
@@ -218,6 +221,12 @@ public class Agent {
     private String runTraced(String userInput, PaiCliTracing.AgentRun traceRun,
                              boolean returnStreamedContent) {
         log.info("ReAct run started: inputLength={}", userInput == null ? 0 : userInput.length());
+        if (CancellationContext.isCancelled()) {
+            boolean timedOut = CancellationContext.isDeadlineExceeded();
+            traceRun.outcome(timedOut ? PaiCliTracing.RunOutcome.TIMEOUT : PaiCliTracing.RunOutcome.CANCELLED,
+                    timedOut ? "全链路 Deadline 已耗尽" : "任务启动前已取消");
+            return CancellationContext.stopMessage("当前任务");
+        }
         pruneHistoricalImagePayloads();
         // 存入短期记忆
         memoryManager.addUserMessage(userInput);
@@ -246,10 +255,12 @@ public class Agent {
         // budget 仅在 token 用尽 / 检测到死循环 / 超出硬轮数时兜底。
         while (true) {
             if (CancellationContext.isCancelled()) {
-                log.info("ReAct run cancelled before iteration");
+                boolean timedOut = CancellationContext.isDeadlineExceeded();
+                log.info("ReAct run stopped before iteration: timeout={}", timedOut);
                 pushStatus(budget, startNanos, "idle");
-                traceRun.outcome(PaiCliTracing.RunOutcome.CANCELLED, "用户在迭代开始前取消");
-                return "⏹️ 已取消当前任务。";
+                traceRun.outcome(timedOut ? PaiCliTracing.RunOutcome.TIMEOUT : PaiCliTracing.RunOutcome.CANCELLED,
+                        timedOut ? "全链路 Deadline 已耗尽" : "用户在迭代开始前取消");
+                return CancellationContext.stopMessage("当前任务");
             }
             // 调 LLM 前评估 conversationHistory 是否接近 window 上限；超阈值就把早期消息压缩成摘要。
             // 这是与第 3 期 Memory 短期记忆压缩并行的另一道压缩——后者只压 shortTermMemory，
@@ -281,11 +292,13 @@ public class Agent {
                 );
                 LlmTraceLogger.logReasoning(log, "react iteration=" + iteration, llmClient, response.reasoningContent());
                 if (CancellationContext.isCancelled()) {
-                    log.info("ReAct run cancelled after LLM response");
+                    boolean timedOut = CancellationContext.isDeadlineExceeded();
+                    log.info("ReAct run stopped after LLM response: timeout={}", timedOut);
                     streamRenderer.finish();
                     pushStatus(budget, startNanos, "idle");
-                    traceRun.outcome(PaiCliTracing.RunOutcome.CANCELLED, "用户在 LLM 响应后取消");
-                    return "⏹️ 已取消当前任务。";
+                    traceRun.outcome(timedOut ? PaiCliTracing.RunOutcome.TIMEOUT : PaiCliTracing.RunOutcome.CANCELLED,
+                            timedOut ? "全链路 Deadline 已耗尽" : "用户在 LLM 响应后取消");
+                    return CancellationContext.stopMessage("当前任务");
                 }
 
                 budget.recordTokens(response.inputTokens(), response.outputTokens(), response.cachedInputTokens());
@@ -350,6 +363,18 @@ public class Agent {
                 traceRun.output(response.content());
                 return finalResponse;
 
+            } catch (LlmTimeoutException e) {
+                log.warn("LLM call timed out in ReAct loop: phase={}", e.phase());
+                streamRenderer.finish();
+                pushStatus(budget, startNanos, "idle");
+                traceRun.error(PaiCliTracing.RunOutcome.TIMEOUT, e);
+                return "⏱️ LLM 调用超时（" + e.phase() + "）: " + e.getMessage();
+            } catch (LlmCancelledException e) {
+                log.info("LLM call cancelled in ReAct loop");
+                streamRenderer.finish();
+                pushStatus(budget, startNanos, "idle");
+                traceRun.outcome(PaiCliTracing.RunOutcome.CANCELLED, e.getMessage());
+                return "⏹️ 已取消当前任务。";
             } catch (IOException e) {
                 log.error("LLM call failed in ReAct loop", e);
                 streamRenderer.finish();
@@ -509,7 +534,7 @@ public class Agent {
     }
 
     private void injectFreshnessWebSearchIfNeeded(String userInput) {
-        if (!shouldRunFreshnessWebSearch(userInput)) {
+        if (CancellationContext.isCancelled() || !shouldRunFreshnessWebSearch(userInput)) {
             return;
         }
         String query = buildFreshnessSearchQuery(userInput);
@@ -534,6 +559,9 @@ public class Agent {
                     %s
                     """.formatted(query, result == null ? "" : result.trim())));
         } catch (Exception e) {
+            if (CancellationContext.isCancelled()) {
+                return;
+            }
             log.warn("Auto freshness web_search preflight failed", e);
             conversationHistory.add(LlmClient.Message.user("""
                     ## 联网预检结果

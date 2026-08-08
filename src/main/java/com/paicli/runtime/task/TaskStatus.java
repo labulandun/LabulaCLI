@@ -5,6 +5,7 @@ public enum TaskStatus {
     RUNNING("running"),
     COMPLETED("completed"),
     FAILED("failed"),
+    TIMED_OUT("timed_out"),
     CANCELED("canceled");
 
     private final String value;

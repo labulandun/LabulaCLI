@@ -11,6 +11,10 @@ public interface McpTransport extends AutoCloseable {
 
     void onReceive(Consumer<JsonNode> listener);
 
+    /** Best-effort cancellation hook for a JSON-RPC request already in transport.send(). */
+    default void cancelRequest(long requestId) {
+    }
+
     default List<String> stderrLines() {
         return List.of();
     }

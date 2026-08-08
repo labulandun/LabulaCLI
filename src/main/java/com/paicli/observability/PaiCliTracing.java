@@ -32,6 +32,7 @@ public final class PaiCliTracing {
     public enum RunOutcome {
         COMPLETED("completed", "DEFAULT", false),
         CANCELLED("cancelled", "WARNING", false),
+        TIMEOUT("timeout", "ERROR", true),
         BUDGET_EXHAUSTED("budget_exhausted", "ERROR", true),
         LLM_ERROR("llm_error", "ERROR", true),
         UNEXPECTED_ERROR("unexpected_error", "ERROR", true);

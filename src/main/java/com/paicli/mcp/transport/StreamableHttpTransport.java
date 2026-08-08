@@ -3,6 +3,9 @@ package com.paicli.mcp.transport;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.paicli.mcp.protocol.McpInitializeRequest;
+import com.paicli.runtime.CancellationContext;
+import com.paicli.runtime.CancellationToken;
+import okhttp3.Call;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -14,6 +17,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
@@ -31,6 +35,7 @@ public class StreamableHttpTransport implements McpTransport {
     private final String url;
     private final Map<String, String> headers;
     private final List<Consumer<JsonNode>> listeners = new CopyOnWriteArrayList<>();
+    private final Map<Long, Call> activeRequests = new ConcurrentHashMap<>();
     private volatile String sessionId;
 
     public StreamableHttpTransport(String url, Map<String, String> headers) {
@@ -52,7 +57,22 @@ public class StreamableHttpTransport implements McpTransport {
             builder.header("Mcp-Session-Id", sessionId);
         }
 
-        try (Response response = client.newCall(builder.build()).execute()) {
+        long timeoutMillis = CancellationContext.remainingMillis(TimeUnit.SECONDS.toMillis(60), 0);
+        if (timeoutMillis <= 0 || CancellationContext.isCancelled()) {
+            throw new IOException("MCP HTTP request cancelled or deadline exceeded");
+        }
+        Call call = client.newCall(builder.build());
+        call.timeout().timeout(timeoutMillis, TimeUnit.MILLISECONDS);
+        Long requestId = message.path("id").isNumber() ? message.path("id").asLong() : null;
+        if (requestId != null) {
+            activeRequests.put(requestId, call);
+        }
+        CancellationToken token = CancellationContext.current();
+        CancellationToken.Registration cancellationRegistration = token == null
+                ? CancellationToken.Registration.NO_OP
+                : token.onCancel(call::cancel);
+
+        try (cancellationRegistration; Response response = call.execute()) {
             String newSession = response.header("Mcp-Session-Id");
             if (newSession != null && !newSession.isBlank()) {
                 sessionId = newSession;
@@ -79,6 +99,11 @@ public class StreamableHttpTransport implements McpTransport {
                     listener.accept(node);
                 }
             }
+        } finally {
+            if (requestId != null) {
+                activeRequests.remove(requestId, call);
+            }
+            call.cancel();
         }
     }
 
@@ -95,7 +120,17 @@ public class StreamableHttpTransport implements McpTransport {
     }
 
     @Override
+    public void cancelRequest(long requestId) {
+        Call call = activeRequests.remove(requestId);
+        if (call != null) {
+            call.cancel();
+        }
+    }
+
+    @Override
     public void close() {
+        activeRequests.values().forEach(Call::cancel);
+        activeRequests.clear();
         if (sessionId == null || sessionId.isBlank()) {
             return;
         }

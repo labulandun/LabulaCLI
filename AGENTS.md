@@ -17,6 +17,7 @@
 - 评测体系 Phase E1–E4 已交付：`com.paicli.eval.EvalMain` 黑盒驱动 `serve --http` 子进程，覆盖 custom（10）/ tool-golden（5）/ safety（8）/ terminal（5）/ swe-lite（10）；artifact 聚合 llm/tool/audit 明细与 tokens/rounds/tool_error_rate，`SandboxExecutor` 分 host/docker 两档，Docker 不可用时 docker 用例 skip 不降级
 - Phase E4 支持 case/run 级并发、`--runs` 覆盖、固定 pass@1/pass@3（含 coverage）、`--max-run-seconds` 总耗时预算；swe-lite 隐藏 fail-to-pass/pass-to-pass 测试固定 UTF-8。2026-08-03 本机 Docker 全量实跑 15 case × 3：43/45 run 通过，pass@1=14/15，pass@3=15/15，总耗时 688.758 秒；详见 `docs/evaluation-system-design.md`
 - Phase E5 第一批已交付：E1–E4 的 artifact/report `schema_version=1`、skip 工件与非空 BOOLEAN 门槛契约已固定；新增非门禁 `LlmJudgeGrader`（off/cache-only/live、版本化 rubric、内容寻址缓存）和 `EvalCompare`（case-set/coverage/pass_rate/token median/safety 基线比较）。Langfuse、Maven CI、线上 20 样本校准、全量验收与 SOP 暂缓
+- 产品运行时已接入全链路 Deadline、主动资源取消、预算内 LLM 重试和按 provider/model/endpoint 隔离的熔断；Eval `--timeout` / `--max-run-seconds` 仍是独立外围门禁
 - 下一步：OAuth / sampling / recovery 作为后续 MCP 增强
 - Banner 版本：`v16.1.0`，Maven 产物：`paicli-1.0-SNAPSHOT.jar`（两者不一致是正常状态）
 
@@ -131,6 +132,14 @@ src/main/java/com/paicli/
 
 - 三条路径都走 `executeTools()`，不手写 for-loop
 - 默认最多 4 个并发，结果保持原始顺序
+- 单工具和并行批次都受父 Deadline 与本地 90 秒上限约束；Deadline 到达时取消子 Future，命令进程与 HTTP MCP 调用还会主动终止底层资源
+
+### Deadline + LLM 弹性
+
+- CLI、Runtime API、Durable Task 与三条 Agent 路径必须共享同一个绝对 Deadline；子步骤只取 `min(本地上限, 父级剩余预算)`，不得重新创建更长预算
+- 用户取消或 Deadline 到达必须通过 `CancellationToken` 主动取消在途 LLM Call、HTTP MCP Call、命令进程和子 Future，并保留 `canceled` / `timed_out` 分类
+- LLM 只在未产生流式输出时对连接错误、408、429、5xx 等瞬时错误做预算内重试；Provider 熔断键固定为 provider + model + endpoint，OPEN 时快速失败
+- 配置读取顺序为系统属性 > 环境变量 > 进程当前工作目录 `.env` > `~/.env` > 默认值；详细键与默认值见 `docs/agents-reference.md`
 
 ### Web + Browser
 

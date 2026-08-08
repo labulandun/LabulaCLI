@@ -3,6 +3,9 @@ package com.paicli.web;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.paicli.runtime.CancellationContext;
+import com.paicli.runtime.CancellationToken;
+import okhttp3.Call;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -114,7 +117,16 @@ public class ZhipuSearchProvider implements SearchProvider {
                 .build();
         log.info("Zhipu search: query={}, engine={}, count={}", query, searchEngine, count);
 
-        try (Response response = httpClient.newCall(request).execute()) {
+        long timeoutMillis = CancellationContext.remainingMillis(TimeUnit.SECONDS.toMillis(20), 0);
+        if (timeoutMillis <= 0 || CancellationContext.isCancelled()) {
+            throw new IOException("智谱搜索已取消或超过 Deadline");
+        }
+        Call call = httpClient.newCall(request);
+        call.timeout().timeout(timeoutMillis, TimeUnit.MILLISECONDS);
+        CancellationToken token = CancellationContext.current();
+        CancellationToken.Registration registration = token == null
+                ? CancellationToken.Registration.NO_OP : token.onCancel(call::cancel);
+        try (registration; Response response = call.execute()) {
             String body = response.body() == null ? "" : response.body().string();
             if (!response.isSuccessful()) {
                 if (response.code() == 401) {
@@ -124,6 +136,8 @@ public class ZhipuSearchProvider implements SearchProvider {
                         + truncate(body, 200));
             }
             return parse(body, count);
+        } finally {
+            call.cancel();
         }
     }
 

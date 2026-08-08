@@ -21,6 +21,7 @@ import com.paicli.policy.CommandGuard;
 import com.paicli.policy.PathGuard;
 import com.paicli.policy.PolicyException;
 import com.paicli.runtime.CancellationContext;
+import com.paicli.runtime.CancellationToken;
 import com.paicli.snapshot.RestoreResult;
 import com.paicli.snapshot.SnapshotService;
 import com.paicli.skill.Skill;
@@ -1261,12 +1262,18 @@ public class ToolRegistry {
             return List.of();
         }
         if (CancellationContext.isCancelled()) {
+            String stopMessage = CancellationContext.stopMessage("本轮工具调用");
             return invocations.stream()
-                    .map(invocation -> ToolExecutionResult.failed(invocation, "用户取消了此次工具调用"))
+                    .map(invocation -> ToolExecutionResult.failed(invocation, stopMessage))
                     .toList();
         }
-        if (invocations.size() == 1) {
-            return List.of(executeTracedInvocation(invocations.get(0)));
+
+        long batchTimeoutMillis = CancellationContext.remainingMillis(
+                TimeUnit.SECONDS.toMillis(toolBatchTimeoutSeconds), 0);
+        if (batchTimeoutMillis <= 0) {
+            return invocations.stream()
+                    .map(invocation -> ToolExecutionResult.timedOut(invocation, 0))
+                    .toList();
         }
 
         int parallelism = Math.min(invocations.size(), MAX_PARALLEL_TOOLS);
@@ -1275,23 +1282,34 @@ public class ToolRegistry {
             thread.setDaemon(true);
             return thread;
         });
+        List<CancellationToken> toolTokens = new ArrayList<>(invocations.size());
+        for (int i = 0; i < invocations.size(); i++) {
+            toolTokens.add(CancellationContext.childToken(batchTimeoutMillis));
+        }
 
         try {
             Context parentContext = Context.current();
-            List<Callable<ToolExecutionResult>> tasks = invocations.stream()
-                    .<Callable<ToolExecutionResult>>map(invocation -> parentContext.wrap(
-                            () -> executeTracedInvocation(invocation)))
-                    .toList();
+            List<Callable<ToolExecutionResult>> tasks = new ArrayList<>(invocations.size());
+            for (int i = 0; i < invocations.size(); i++) {
+                ToolInvocation invocation = invocations.get(i);
+                CancellationToken toolToken = toolTokens.get(i);
+                tasks.add(parentContext.wrap(() -> {
+                    try (CancellationContext.Scope ignored = CancellationContext.bind(toolToken)) {
+                        return executeTracedInvocation(invocation);
+                    }
+                }));
+            }
 
             List<Future<ToolExecutionResult>> futures =
-                    executor.invokeAll(tasks, toolBatchTimeoutSeconds, TimeUnit.SECONDS);
+                    executor.invokeAll(tasks, batchTimeoutMillis, TimeUnit.MILLISECONDS);
 
             List<ToolExecutionResult> results = new ArrayList<>();
             for (int i = 0; i < futures.size(); i++) {
                 ToolInvocation invocation = invocations.get(i);
                 Future<ToolExecutionResult> future = futures.get(i);
                 if (future.isCancelled()) {
-                    results.add(ToolExecutionResult.timedOut(invocation, toolBatchTimeoutSeconds));
+                    toolTokens.get(i).timeout();
+                    results.add(ToolExecutionResult.timedOut(invocation, batchTimeoutMillis));
                     continue;
                 }
 
@@ -1311,11 +1329,13 @@ public class ToolRegistry {
             return results;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            toolTokens.forEach(CancellationToken::cancel);
             return invocations.stream()
                     .map(invocation -> ToolExecutionResult.failed(invocation, "工具批次执行被中断"))
                     .toList();
         } finally {
             executor.shutdownNow();
+            toolTokens.forEach(CancellationToken::close);
         }
     }
 
@@ -1391,19 +1411,35 @@ public class ToolRegistry {
             process = pb.start();
 
             Process runningProcess = process;
-            Future<String> outputFuture = outputReaderExecutor.submit(() -> readProcessOutput(runningProcess));
+            CancellationToken token = CancellationContext.current();
+            CancellationToken.Registration cancellationRegistration = token == null
+                    ? CancellationToken.Registration.NO_OP
+                    : token.onCancel(runningProcess::destroyForcibly);
+            try (cancellationRegistration) {
+                Future<String> outputFuture = outputReaderExecutor.submit(
+                        CancellationContext.wrap((Callable<String>)
+                                () -> readProcessOutput(runningProcess)));
+                long commandTimeoutMillis = CancellationContext.remainingMillis(
+                        TimeUnit.SECONDS.toMillis(commandTimeoutSeconds), 0);
+                if (commandTimeoutMillis <= 0) {
+                    runningProcess.destroyForcibly();
+                    outputFuture.cancel(true);
+                    return CancellationContext.stopMessage("命令执行");
+                }
 
-            boolean finished = process.waitFor(commandTimeoutSeconds, TimeUnit.SECONDS);
-            if (!finished) {
-                process.destroyForcibly();
-                process.waitFor(2, TimeUnit.SECONDS);
-                outputFuture.cancel(true);
-                return "命令执行超时（" + commandTimeoutSeconds + "秒），已强制终止";
+                boolean finished = process.waitFor(commandTimeoutMillis, TimeUnit.MILLISECONDS);
+                if (!finished) {
+                    process.destroyForcibly();
+                    process.waitFor(2, TimeUnit.SECONDS);
+                    outputFuture.cancel(true);
+                    return "命令执行超时（" + Math.max(1, TimeUnit.MILLISECONDS.toSeconds(commandTimeoutMillis))
+                            + "秒），已强制终止";
+                }
+
+                String output = getCommandOutput(outputFuture);
+                int exitCode = process.exitValue();
+                return String.format("命令执行完成 (exit code: %d)\n%s", exitCode, output);
             }
-
-            String output = getCommandOutput(outputFuture);
-            int exitCode = process.exitValue();
-            return String.format("命令执行完成 (exit code: %d)\n%s", exitCode, output);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             if (process != null) {
@@ -1482,13 +1518,14 @@ public class ToolRegistry {
             return completed(invocation, "工具执行失败: " + message, 0);
         }
 
-        private static ToolExecutionResult timedOut(ToolInvocation invocation, long timeoutSeconds) {
+        private static ToolExecutionResult timedOut(ToolInvocation invocation, long timeoutMillis) {
+            long displaySeconds = Math.max(1, TimeUnit.MILLISECONDS.toSeconds(timeoutMillis));
             return new ToolExecutionResult(
                     invocation.id(),
                     invocation.name(),
                     invocation.argumentsJson(),
-                    "工具执行超时（" + timeoutSeconds + "秒），已取消",
-                    timeoutSeconds * 1000,
+                    "工具执行超时（" + displaySeconds + "秒），已取消",
+                    Math.max(0, timeoutMillis),
                     true,
                     List.of()
             );

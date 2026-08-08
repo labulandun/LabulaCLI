@@ -112,7 +112,7 @@ Plan / Team 的 raw-mode 单键交互不接 autocomplete，避免干扰 `ESC` / 
 运行中可输入 /cancel 并回车取消当前任务。
 ```
 
-用户输入 `/cancel` 后，PaiCLI 会设置当前运行的 `CancellationToken`，并中断后台 runner。ReAct、Plan-and-Execute、Multi-Agent 编排、工具批量执行以及 `execute_command` 会在边界处检查取消信号；如果底层 LLM HTTP 流式调用无法立即响应 Java interrupt，取消属于 best-effort，但后续工具执行不会继续推进。
+用户输入 `/cancel` 或运行达到 Deadline 后，PaiCLI 会取消当前 `CancellationToken`。ReAct、Plan-and-Execute、Multi-Agent、工具批次和 MCP 请求共享同一剩余预算；在途 LLM/HTTP MCP Call 会执行 `Call.cancel()`，命令进程会被终止，pending MCP request 会本地完成并异步发送 `notifications/cancelled`。远端 MCP server 是否立即停止仍取决于其协议实现。
 
 ## 5. 测试证据
 
@@ -142,5 +142,4 @@ mvn test
 
 1. OAuth：Authorization Code + PKCE、loopback callback、token store chmod 600、401 refresh
 2. Sampling：`JsonRpcClient.onRequest`、强制 HITL、预算控制、递归深度限制
-3. Cancel 增强：pending MCP request cancelled notification、不可中断 HTTP 调用的更细粒度协作取消
-4. Recovery：stdio EOF / HTTP 连接失败触发指数退避重启
+3. Recovery：stdio EOF / HTTP 连接失败触发指数退避重启

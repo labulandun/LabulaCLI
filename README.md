@@ -1,5 +1,12 @@
-#LabulaCLI
+# LabulaCLI
 
+### 运行时 Deadline 与 LLM 弹性
+
+- CLI、Runtime API、后台任务、ReAct、Plan 和 Team 共用绝对 Deadline；默认根任务 600 秒、Plan/Team 单步 180 秒，并向 LLM、工具与 MCP 传递剩余预算
+- Deadline 或用户取消会主动取消正在执行的 LLM HTTP Call、HTTP MCP Call、命令进程和子 Future；后台任务会区分 `timed_out` 与 `canceled`
+- LLM 单次尝试默认上限 180 秒、首 token 60 秒；仅对连接/EOF/Socket 超时、408、429、5xx 等瞬时错误在预算内重试 1 次，已收到流式增量后不重试
+- Provider 熔断按 `provider + model + endpoint` 隔离，默认 60 秒窗口内 3 次故障 OPEN 30 秒，再以 1 个 HALF_OPEN 探针恢复；OPEN 时快速失败，当前不自动切换 Provider
+- 配置支持 `-D` 系统属性、环境变量、进程当前工作目录 `.env`、`~/.env`，详见 `.env.example`；评测参数 `--timeout` / `--max-run-seconds` 是外围门禁，不代替产品 Deadline
 
 ### OpenTelemetry / Langfuse 可观测性（ReAct MVP）
 
