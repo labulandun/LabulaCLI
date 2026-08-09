@@ -201,9 +201,12 @@ scheme 白名单(http/https) / 主机黑名单(localhost/loopback/link-local/sit
 
 ### Git Side-History Snapshot (Phase 18)
 
-- side-git 在 ~/.paicli/snapshots/ 维护独立仓库（JGit，不依赖系统 git）
+- side-git 在 `~/.paicli/snapshots/` 维护 bare 仓库（JGit，不依赖系统 git），不配置项目 worktree
+- PaiCLI 扫描工作区并通过 `ObjectInserter` / `DirCache` / `CommitBuilder` 构建快照，只推进 `refs/paicli/snapshots/history`，不操作普通 `HEAD`
 - pre-turn 同步，post-turn 异步
 - revert_turn 纳入 HITL/AuditLog，恢复前先创建 pre-restore 快照
+- 启动检测到项目 `.git` 指向快照根时会禁用快照并报告迁移错误；`/snapshot clean` 会拒绝删除与项目当前 GitDir 重叠的目录，并等待异步写入结束
+- 旧版 Side-Git 的快照 HEAD 会迁移为独立快照引用但不再推进 HEAD；已经混入项目/远端历史的提交不会自动重写
 
 ### Prompt Layering (Phase 19)
 

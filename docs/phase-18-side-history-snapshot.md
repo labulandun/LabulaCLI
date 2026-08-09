@@ -1,6 +1,6 @@
 # 第 18 期：Git Side-History 快照与回滚
 
-> 当前状态：MVP 开发中。第 18 期目标是给 Agent 改文件加一层文件安全网：每个 turn 前后自动快照，用户可以恢复到某个 turn 开始前，而且不污染用户项目自己的 `.git` 历史。
+> 当前状态：已交付；2026-08-09 完成隔离加固。快照仓库改为 bare repo，快照只写独立引用，不再把真实项目绑定为 Side-Git worktree。
 
 ## 目标
 
@@ -20,7 +20,7 @@ Agent 能放心改代码的前提不是“永远不犯错”，而是“改坏�
 
 - `SideGitManager`
   - 初始化 side-git 仓库
-  - 执行 add / commit / list / restore
+  - 扫描工作区，通过 JGit blob / tree / commit 对象执行 snapshot / list / restore
   - 负责 project root 与 snapshot root 的路径计算
 - `SnapshotConfig`
   - `enabled`
@@ -52,6 +52,8 @@ Agent 能放心改代码的前提不是“永远不犯错”，而是“改坏�
 - 不能写用户项目 `.git`
 - 不能依赖系统 `git` 命令
 - 优先使用 JGit 纯 Java 实现
+- 仓库必须是 bare repo，不配置 `worktree`
+- 快照只更新 `refs/paicli/snapshots/history`，不推进普通 `HEAD`
 - project hash 与 worktree hash 必须稳定，路径移动后生成新 side history
 
 ### 3. 依赖
@@ -157,7 +159,7 @@ PAICLI_SNAPSHOT_EXCLUDES=.git,.paicli/snapshots,target,node_modules,dist,.idea,*
 
 - `/snapshot`：列最近快照，默认显示最近 10 个 turn
 - `/snapshot status`：显示 side-git 目录、enabled、max、排除规则
-- `/snapshot clean`：清理当前项目的 side-git 快照目录
+- `/snapshot clean`：等待异步写入结束后清理当前项目的 side-git 快照目录；若目录与项目当前 GitDir 重叠则拒绝
 - `/restore <N>`：恢复到最近第 N 个 pre-turn 快照，`N=1` 表示恢复到最近一个 turn 开始前
 
 恢复前必须先做 `pre-restore` 快照，避免用户恢复错了没有退路。
@@ -191,6 +193,7 @@ revert_turn
 - 不做 per-tool 自动快照。第 18 期先做 turn 级别，避免并行工具调用时快照交错。
 - 不改变用户项目 `.git` 的 branch、index、HEAD。
 - 不自动提交用户项目 Git。
+- 不自动重写旧版本已经混入项目或远端历史的快照提交。
 - 不做远程备份。
 - 不做冲突交互式 merge。恢复就是把目标快照内容写回工作区。
 
@@ -206,7 +209,8 @@ revert_turn
 ### Day 2：SideGitManager 初始化与提交
 
 - [x] 初始化独立 side-git 仓库
-- [x] 配置 worktree 指向项目根
+- [x] 使用 bare repo，不绑定项目 worktree
+- [x] 使用 `ObjectInserter` / `DirCache` / `CommitBuilder` 构建快照并写入 `refs/paicli/snapshots/history`
 - [x] 实现 `preTurnSnapshot(turnId)` / `postTurnSnapshot(turnId)`
 - [x] 实现默认 excludes
 - [x] 写 `SideGitManagerTest`
@@ -255,7 +259,7 @@ revert_turn
 必跑测试：
 
 ```bash
-mvn test -Dtest=SnapshotConfigTest,SideGitManagerTest,SnapshotStoreTest,RestoreSnapshotTest
+mvn test -Dtest=SideGitManagerTest
 mvn test -Dtest=MainInputNormalizationTest,CliCommandParserTest,ToolRegistryTest
 mvn test -Pquick
 mvn test
@@ -272,7 +276,7 @@ mvn test
 mvn -q clean package -DskipTests
 ```
 
-结果：以上命令均通过；全量 `mvn test` 为 596 个测试，0 failures / 0 errors。
+结果以当前 Maven 输出为准，不在设计文档中固化历史测试总数。
 
 手工验收：
 
@@ -282,11 +286,15 @@ mvn -q clean package -DskipTests
 4. `target/`、`.git/`、`node_modules/` 不进入 side history。
 5. `revert_turn` 在 HITL 开启时会弹审批。
 6. TUI 模式下执行一轮普通任务，也会生成快照。
+7. 确认 side repo 为 bare，快照仅出现在 `refs/paicli/snapshots/*`，普通 `HEAD` 不推进。
+8. 将项目 `.git` 指向快照目录时，启动告警且 `/snapshot clean` 拒绝删除。
 
 ## 验收标准
 
 - 自动快照默认开启，但失败不阻塞 Agent。
 - `/restore 1` 能恢复最近 turn 开始前的工作区文件。
 - 用户项目 `.git` 不被写入、不被 reset、不被 checkout。
+- side repo 不绑定项目 worktree，快照只写 `refs/paicli/snapshots/*`。
+- 迁移检测与清理保护能阻止快照目录承载项目 GitDir 时继续写入或删除。
 - `maxSnapshots` 对列表/定位上限生效；历史压缩留作后续增强。
 - ReAct / Plan / Team / TUI 四条入口行为一致。

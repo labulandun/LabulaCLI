@@ -3,6 +3,7 @@ package com.paicli.snapshot;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -37,8 +38,8 @@ public class SnapshotService implements AutoCloseable {
         }
     }
 
-    public void snapshotBeforeTurn(String turnId, String summary) {
-        if (!manager.config().enabled()) {
+    public synchronized void snapshotBeforeTurn(String turnId, String summary) {
+        if (!manager.isEnabled()) {
             return;
         }
         try {
@@ -48,8 +49,8 @@ public class SnapshotService implements AutoCloseable {
         }
     }
 
-    public void snapshotAfterTurnAsync(String turnId, String summary) {
-        if (!manager.config().enabled()) {
+    public synchronized void snapshotAfterTurnAsync(String turnId, String summary) {
+        if (!manager.isEnabled()) {
             return;
         }
         lastAsyncTask = executor.submit(() -> {
@@ -75,8 +76,17 @@ public class SnapshotService implements AutoCloseable {
         return manager.formatStatus();
     }
 
-    public String clean() {
-        return manager.cleanSnapshots();
+    public synchronized String clean() {
+        try {
+            awaitIdle();
+            return manager.cleanSnapshots();
+        } catch (Exception e) {
+            return "❌ 清理快照失败: 无法等待正在写入的快照 - " + e.getMessage();
+        }
+    }
+
+    public Optional<String> startupWarning() {
+        return manager.startupWarning();
     }
 
     public SideGitManager manager() {

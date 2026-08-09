@@ -8,6 +8,13 @@
 - Provider 熔断按 `provider + model + endpoint` 隔离，默认 60 秒窗口内 3 次故障 OPEN 30 秒，再以 1 个 HALF_OPEN 探针恢复；OPEN 时快速失败，当前不自动切换 Provider
 - 配置支持 `-D` 系统属性、环境变量、进程当前工作目录 `.env`、`~/.env`，详见 `.env.example`；评测参数 `--timeout` / `--max-run-seconds` 是外围门禁，不代替产品 Deadline
 
+### Side-Git 快照隔离
+
+- 快照使用 `~/.paicli/snapshots/<project_hash>/<worktree_hash>/.git` 下的 bare JGit 仓库，不把真实项目绑定为 Git worktree
+- 工作区文件由 PaiCLI 扫描后直接构建 blob/tree/commit，快照历史只推进 `refs/paicli/snapshots/history`，不操作项目或 Side-Git 的普通 `HEAD`
+- 启动时若发现项目 `.git` 指向 PaiCLI 快照目录，会禁用快照并在首屏报告迁移错误；`/snapshot clean` 遇到待删目录与项目当前 GitDir 重叠时会拒绝
+- `/restore <N>` 只写回快照文件，项目 `.git`、branch、HEAD 与 index 保持不变；旧版本已混入正常 Git 历史的快照提交不会被自动重写
+
 ### OpenTelemetry / Langfuse 可观测性（ReAct MVP）
 
 - 已加入 OpenTelemetry Java SDK、OTLP exporter 与自动配置模块，默认未配置时不启动 exporter

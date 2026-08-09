@@ -155,6 +155,13 @@ src/main/java/com/paicli/
 - system prompt 索引段注入三处提示词，上限 20 个 / 4KB
 - `load_skill` → SkillContextBuffer → 下一轮 user message 前置注入
 
+### Side-Git 快照
+
+- Side-Git 必须是无 worktree 的 bare 仓库；工作区扫描后用 JGit 对象 API 构建 tree/commit，只更新 `refs/paicli/snapshots/*`
+- 禁止通过 `setDirectory(projectRoot)`、`setWorkTree(projectRoot)` 或普通 `Git.commit()` 绑定项目工作区、写项目 `.git` 或推进普通 `HEAD`
+- 项目 `.git` 指向配置的快照目录时必须禁用快照并报告迁移错误；`/snapshot clean` 在待删目录与项目当前 GitDir 重叠时必须拒绝
+- 恢复只写工作区文件，不修改项目 branch、HEAD、index；旧版本已混入项目历史的快照提交不在自动修复范围内
+
 ## 修改时的硬规则
 
 ### 1. 改行为 → 同步文档

@@ -312,6 +312,12 @@ public class Main {
             reactAgent.setExternalContextSupplier(mcpServerManager::resourceIndexForPrompt);
             reactAgent.setSkillRegistry(skillRegistry);
             reactAgent.setSkillContextBuffer(skillContextBuffer);
+            String snapshotWarning = reactAgent.getToolRegistry().getSnapshotService()
+                    .startupWarning()
+                    .orElse("");
+            if (!snapshotWarning.isBlank()) {
+                startupNote = appendStartupNote(startupNote, "Side-Git 迁移保护: " + snapshotWarning);
+            }
             DurableTaskManager taskManager = openTaskManager(llmClientRef, tracing);
             taskManager.start();
             Runtime.getRuntime().addShutdownHook(new Thread(taskManager::close, "paicli-task-shutdown"));

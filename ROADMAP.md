@@ -461,18 +461,19 @@
 **目标**：Agent 每次 turn 前后自动做 workspace 快照，用户可以一键回滚到任意 turn 之前的状态，不污染用户的 `.git` 历史。对标 DeepSeek TUI 的 `snapshot/` 系统。
 
 **功能迭代**：
-- `SideGitManager`：在 `~/.paicli/snapshots/<project_hash>/<worktree_hash>/.git` 维护独立 side-git 仓库，通过 JGit 纯 Java 实现，与用户的工作区 `.git` 完全隔离
-- `preTurnSnapshot()`：每个 turn 开始前，对 workspace 执行 JGit add/commit 并标记 `"pre-turn <turn_id>"`；MVP 采用同步 pre 快照，确保 Agent 改文件前已经保存基线
+- `SideGitManager`：在 `~/.paicli/snapshots/<project_hash>/<worktree_hash>/.git` 维护 bare side-git 仓库，通过 JGit 对象 API 构建快照，与用户的工作区 `.git` 完全隔离
+- `preTurnSnapshot()`：每个 turn 开始前扫描 workspace，通过 blob/tree/commit 对象写入 `refs/paicli/snapshots/history` 并标记 `"pre-turn <turn_id>"`；采用同步 pre 快照，确保 Agent 改文件前已经保存基线
 - `postTurnSnapshot()`：turn 结束后异步执行第二次快照，commit message 标记 `"post-turn <turn_id>"`
 - `/restore <N>` 命令：从最近 N 个 turn 的 pre-turn 快照中恢复文件到工作区，不改变用户 `.git` 和对话历史
 - `revert_turn` 工具：LLM 可调用的回滚工具，让 Agent 自己能判断"改坏了需要撤销"
-- 快照策略可配：`max_snapshots`（默认保留最近 50 个 turn）、`snapshot_excludes`（默认排除 `.git/`、`node_modules/`、`target/`）
+- 快照策略可配：`max_snapshots`（默认列表/定位最近 50 个快照，物理裁剪仍属后续增强）、`snapshot_excludes`（默认排除 `.git/`、`node_modules/`、`target/`）
+- 隔离保护：项目 `.git` 指向 PaiCLI 快照目录时禁用快照并报告迁移错误；清理目录与项目 GitDir 重叠时拒绝执行
 
 **设计参考**：DeepSeek TUI `crates/tui/src/core/engine.rs` 的 `pre_turn_snapshot()` / `post_turn_snapshot()` + `crates/tui/src/core/turn.rs` 的 `pre_tool_snapshot()`。
 
 **核心知识点**：
 - Git 内部对象模型（tree / commit / blob）与 JGit API
-- Side-git 仓库隔离技术（独立 `.git` 目录 + `--work-tree` 等价操作）
+- Side-git 仓库隔离技术（bare repo + JGit 对象写入 + `refs/paicli/snapshots/*`）
 - Turn 粒度的自动快照策略
 - 异步快照不阻塞主流程的 fire-and-forget 模式
 
