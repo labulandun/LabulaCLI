@@ -21,6 +21,7 @@ import com.paicli.skill.SkillIndexFormatter;
 import com.paicli.skill.SkillRegistry;
 import com.paicli.util.AnsiStyle;
 import com.paicli.tool.ToolRegistry;
+import com.paicli.tool.ToolResultAccumulator;
 import com.paicli.tool.ToolRegistry.ToolExecutionResult;
 import com.paicli.tool.ToolRegistry.ToolInvocation;
 import com.paicli.util.TerminalMarkdownRenderer;
@@ -561,7 +562,8 @@ public class PlanExecuteAgent {
                         Path.of(toolRegistry.getProjectPath()))
         ));
 
-        StringBuilder allResults = new StringBuilder();
+        ToolResultAccumulator allResults = new ToolResultAccumulator(
+                toolRegistry.getToolResultManifestHandle());
         int iteration = 0;
         TaskStreamRenderer streamRenderer = new TaskStreamRenderer(task.getId(), streamState, out);
 
@@ -610,7 +612,7 @@ public class PlanExecuteAgent {
             if (!response.hasToolCalls()) {
                 memoryManager.recordTokenUsage(totalInputTokens, totalOutputTokens, totalCachedInputTokens);
                 if (!allResults.isEmpty() && (response.content() == null || response.content().isBlank())) {
-                    String toolOnlyResult = allResults.toString().trim();
+                    String toolOnlyResult = allResults.build().trim();
                     if (!toolOnlyResult.isBlank()) {
                         memoryManager.addAssistantMessage("[计划任务 " + task.getId() + "] " + toolOnlyResult);
                     }
@@ -639,13 +641,13 @@ public class PlanExecuteAgent {
             List<ToolExecutionResult> toolResults = executeToolCalls(task.getId(), response.toolCalls());
             for (ToolExecutionResult toolResult : toolResults) {
                 memoryManager.addToolResult(toolResult.name(), toolResult.result());
-                allResults.append(toolResult.result()).append("\n");
+                allResults.add(toolResult);
                 messages.add(LlmClient.Message.tool(toolResult.id(), toolResult.result()));
             }
             appendImageToolMessages(messages, toolResults);
         }
 
-        String fallbackResult = allResults.toString().trim();
+        String fallbackResult = allResults.build().trim();
         if (!fallbackResult.isBlank()) {
             memoryManager.addAssistantMessage("[计划任务 " + task.getId() + "] " + fallbackResult);
         }
@@ -702,7 +704,8 @@ public class PlanExecuteAgent {
         }
         List<ToolExecutionResult> results = toolRegistry.executeTools(invocations);
         for (ToolExecutionResult result : results) {
-            log.debug("Task {} tool result preview [{}]: {}", taskId, result.name(), preview(result.result(), 300));
+            log.debug("Task {} tool result [{}]: {}", taskId, result.name(),
+                    preview(result.observabilitySummary(), 500));
         }
         return results;
     }

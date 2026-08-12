@@ -96,6 +96,20 @@ class MemoryManagerTest {
         assertEquals(180000, memoryManager.getContextProfile().compressionTriggerTokens());
     }
 
+    @Test
+    void toolResultMemoryPreviewDoesNotSplitSurrogatePairs() {
+        MemoryManager memoryManager = new MemoryManager(
+                new StubGLMClient(List.of()),
+                32768,
+                128000,
+                new LongTermMemory(tempDir.resolve("unicode-memory").toFile()));
+
+        memoryManager.addToolResult("demo", "😀".repeat(600));
+
+        String content = memoryManager.getShortTermMemory().getAll().get(0).getContent();
+        assertTrue(content.contains("😀".repeat(500) + "...(已截断)"));
+    }
+
     private static final class StubGLMClient extends GLMClient {
         private final Queue<ChatResponse> responses;
 

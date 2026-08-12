@@ -34,6 +34,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.PrintStream;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -388,8 +389,37 @@ public class Agent {
      * 清空对话历史并重建基础系统提示，不影响长期记忆条目
      */
     public void clearHistory() {
+        resetConversationState(true);
+    }
+
+    /** Switches project/artifact scope and drops messages that contain handles from the old scope. */
+    public boolean switchProjectPath(String projectPath) {
+        if (projectPath == null || projectPath.isBlank()) {
+            return false;
+        }
+        Path previous = Path.of(toolRegistry.getProjectPath()).toAbsolutePath().normalize();
+        Path next = Path.of(projectPath).toAbsolutePath().normalize();
+        boolean changed;
+        try {
+            changed = !Files.isSameFile(previous, next);
+        } catch (IOException ignored) {
+            changed = !previous.equals(next);
+        }
+        toolRegistry.setProjectPath(next.toString());
+        memoryManager.setProjectPath(next.toString());
+        if (changed) {
+            // ToolRegistry has already rebound to a fresh artifact session. Do not rotate it twice.
+            resetConversationState(false);
+        }
+        return changed;
+    }
+
+    private void resetConversationState(boolean rotateArtifactSession) {
         conversationHistory.clear();
         conversationHistory.add(LlmClient.Message.system(buildSystemPrompt("")));
+        if (rotateArtifactSession) {
+            toolRegistry.clearToolResultArtifacts();
+        }
 
         // 清空短期记忆
         memoryManager.clearShortTerm();
@@ -469,7 +499,7 @@ public class Agent {
         }
 
         boolean hasPartial = toolResults != null && toolResults.stream()
-                .anyMatch(r -> r.result() != null && r.result().contains("partial: true"));
+                .anyMatch(ToolExecutionResult::partial);
 
         if (consecutiveSearchToolCalls >= EXPLORE_PRECHECK_THRESHOLD || hasPartial && consecutiveSearchToolCalls >= 3) {
             String hint = "💡 系统提示：检测到连续 " + consecutiveSearchToolCalls
@@ -548,7 +578,10 @@ public class Agent {
                     .toString();
             log.info("Auto freshness web_search preflight: query={}", query);
             renderer().stream().println(AnsiStyle.subtle("  → 检测到时效性问题，已先联网搜索 \"" + query + "\""));
-            String result = toolRegistry.executeTool("web_search", args);
+            String callId = "freshness-" + UUID.randomUUID().toString().replace("-", "");
+            List<ToolExecutionResult> preflightResults = toolRegistry.executeTools(List.of(
+                    new ToolInvocation(callId, "web_search", args)));
+            String result = preflightResults.isEmpty() ? "" : preflightResults.get(0).result();
             conversationHistory.add(LlmClient.Message.user("""
                     ## 联网预检结果
 
@@ -563,12 +596,19 @@ public class Agent {
                 return;
             }
             log.warn("Auto freshness web_search preflight failed", e);
+            String failureMessage = e.getMessage();
+            if (failureMessage != null
+                    && failureMessage.codePointCount(0, failureMessage.length()) > 1_000) {
+                failureMessage = failureMessage.substring(
+                        0, failureMessage.offsetByCodePoints(0, 1_000));
+            }
+            String failure = compactOneLine(failureMessage, 240);
             conversationHistory.add(LlmClient.Message.user("""
                     ## 联网预检结果
 
                     本轮问题需要最新信息，系统已尝试自动联网搜索，但搜索执行失败：%s
                     回答时必须说明这是联网失败后的降级结果，不要声称工具不可用。
-                    """.formatted(e.getMessage())));
+                    """.formatted(failure.isBlank() ? "未知错误" : failure)));
         }
     }
 
@@ -694,6 +734,13 @@ public class Agent {
                 .append(profile.mcpResourceIndexEnabled() ? "开启" : "关闭（window 不足 32k）")
                 .append("\n");
         sb.append("  prompt cache: ").append(profile.promptCacheMode()).append("\n");
+        sb.append("  Tool artifacts: ")
+                .append(toolRegistry.getToolResultArtifactCount())
+                .append(" files / ")
+                .append(formatArtifactBytes(toolRegistry.getToolResultArtifactBytes()))
+                .append(" / manifest ")
+                .append(toolRegistry.getToolResultManifestHandle())
+                .append("\n");
         sb.append("\n");
         sb.append(memoryManager.getSystemStatus());
         return sb.toString();
@@ -702,6 +749,16 @@ public class Agent {
     private String modelLabel() {
         if (llmClient == null) return "(no model)";
         return llmClient.getModelName() + " (" + llmClient.getProviderName() + ")";
+    }
+
+    private static String formatArtifactBytes(long bytes) {
+        if (bytes < 1024) {
+            return bytes + " B";
+        }
+        if (bytes < 1024L * 1024L) {
+            return String.format(Locale.ROOT, "%.1f KiB", bytes / 1024.0);
+        }
+        return String.format(Locale.ROOT, "%.1f MiB", bytes / (1024.0 * 1024.0));
     }
 
     private int estimateToolsSchemaTokens() {
@@ -886,7 +943,7 @@ public class Agent {
         }
         List<ToolExecutionResult> results = toolRegistry.executeTools(invocations);
         for (ToolExecutionResult result : results) {
-            log.debug("Tool result preview [{}]: {}", result.name(), preview(result.result(), 300));
+            log.debug("Tool result [{}]: {}", result.name(), preview(result.observabilitySummary(), 500));
             emitToolResultSummary(result);
         }
         return results;
@@ -894,6 +951,11 @@ public class Agent {
 
     private void emitToolResultSummary(ToolExecutionResult result) {
         if (result == null || result.name() == null) {
+            return;
+        }
+        if (result.artifactWriteFailed()) {
+            renderer().stream().println(AnsiStyle.subtle(
+                    "  → 工具结果落盘失败，仅保留有界预览（" + result.name() + "）"));
             return;
         }
         String summary = switch (result.name()) {
@@ -907,12 +969,15 @@ public class Agent {
     }
 
     private String webSearchSummary(ToolExecutionResult result) {
-        String text = result.result() == null ? "" : result.result();
-        boolean stepSearch = isStepSearchResult(text);
-        if (text.startsWith("搜索失败") || text.startsWith("⚠️") || text.contains("未找到相关结果")) {
-            return compactOneLine(text, 120);
+        String text = result.displayPreview() == null ? "" : result.displayPreview();
+        boolean stepSearch = result.resultMetadata().stepSearch();
+        if (result.resultMetadata().failed() || text.contains("未找到相关结果")) {
+            return compactOneLine(result.resultMetadata().firstLine(), 120);
         }
-        long count = text.lines().filter(line -> line.matches("^\\d+\\.\\s+.*")).count();
+        long count = result.resultMetadata().resultCount();
+        if (count == 0) {
+            count = text.lines().filter(line -> line.matches("^\\d+\\.\\s+.*")).count();
+        }
         String query = extractJsonArg(result.argumentsJson(), "query");
         String label = query.isBlank() ? "搜索结果" : "搜索 \"" + query + "\"";
         if (stepSearch) {
@@ -924,19 +989,22 @@ public class Agent {
     }
 
     private String webFetchSummary(ToolExecutionResult result) {
-        String text = result.result() == null ? "" : result.result();
-        boolean stepSearch = isStepSearchResult(text);
+        String text = result.displayPreview() == null ? "" : result.displayPreview();
+        boolean stepSearch = result.resultMetadata().stepSearch();
         String url = extractJsonArg(result.argumentsJson(), "url");
         String target = url.isBlank() ? "页面" : compactOneLine(url.replaceFirst("^https?://", ""), 80);
         String verb = stepSearch ? "StepSearch · 抓取 " : "抓取 ";
-        if (text.startsWith("抓取失败") || text.startsWith("❌")) {
-            return verb + target + " 失败: " + compactOneLine(text, 100);
+        if (result.resultMetadata().failed()) {
+            return verb + target + " 失败: " + compactOneLine(result.resultMetadata().firstLine(), 100);
         }
-        String title = text.lines()
-                .filter(line -> line.startsWith("📄 标题:"))
-                .map(line -> line.substring("📄 标题:".length()).trim())
-                .findFirst()
-                .orElse("");
+        String title = result.resultMetadata().title();
+        if (title.isBlank()) {
+            title = text.lines()
+                    .filter(line -> line.startsWith("📄 标题:"))
+                    .map(line -> line.substring("📄 标题:".length()).trim())
+                    .findFirst()
+                    .orElse("");
+        }
         String length = text.lines()
                 .filter(line -> line.startsWith("📏 正文"))
                 .findFirst()

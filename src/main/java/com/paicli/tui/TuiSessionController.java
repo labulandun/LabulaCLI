@@ -25,6 +25,7 @@ import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
 /**
@@ -48,6 +49,7 @@ public final class TuiSessionController implements AutoCloseable {
 
     private volatile Future<?> currentTask;
     private volatile CancellationToken currentToken;
+    private final AtomicBoolean activeRun = new AtomicBoolean();
 
     public TuiSessionController(PaiCliConfig config,
                                 LlmClient llmClient,
@@ -58,6 +60,21 @@ public final class TuiSessionController implements AutoCloseable {
                                 Runnable closeWindow,
                                 Runnable showConfigPanel,
                                 Consumer<Runnable> uiExecutor) {
+        this(config, llmClient, reactAgent, hitlHandler, centerPane, statusPane,
+                closeWindow, showConfigPanel, uiExecutor,
+                new ConversationSnapshot(ConversationSnapshot.generateSessionId()));
+    }
+
+    TuiSessionController(PaiCliConfig config,
+                         LlmClient llmClient,
+                         Agent reactAgent,
+                         HitlHandler hitlHandler,
+                         CenterPane centerPane,
+                         StatusPane statusPane,
+                         Runnable closeWindow,
+                         Runnable showConfigPanel,
+                         Consumer<Runnable> uiExecutor,
+                         ConversationSnapshot history) {
         this.config = Objects.requireNonNull(config);
         this.llmClient = Objects.requireNonNull(llmClient);
         this.reactAgent = Objects.requireNonNull(reactAgent);
@@ -67,7 +84,7 @@ public final class TuiSessionController implements AutoCloseable {
         this.closeWindow = Objects.requireNonNull(closeWindow);
         this.showConfigPanel = Objects.requireNonNull(showConfigPanel);
         this.uiExecutor = Objects.requireNonNull(uiExecutor);
-        this.history = new ConversationSnapshot(ConversationSnapshot.generateSessionId());
+        this.history = Objects.requireNonNull(history);
         this.executor = Executors.newSingleThreadExecutor(r -> {
             Thread thread = new Thread(r, "paicli-tui-agent-runner");
             thread.setDaemon(true);
@@ -113,6 +130,10 @@ public final class TuiSessionController implements AutoCloseable {
             return true;
         }
         if ("/clear".equals(lower) || "clear".equals(lower)) {
+            if (isTaskRunning()) {
+                appendSystem("当前任务仍在运行，无法清空对话与工具结果工件；请先输入 /cancel 并等待任务结束。");
+                return true;
+            }
             reactAgent.clearHistory();
             hitlHandler.clearApprovedAll();
             ui(() -> centerPane.clear());
@@ -251,39 +272,46 @@ public final class TuiSessionController implements AutoCloseable {
     }
 
     private void runAgentTask(String input, RunMode mode) {
-        CancellationToken token = CancellationContext.startRun();
-        currentToken = token;
-        statusPane.startTimer();
-        statusPane.updateMode(mode.label);
-        appendSystem(mode.label + " 运行中...");
-        String output;
+        activeRun.set(true);
         try {
-            SnapshotService snapshots = reactAgent.getToolRegistry().getSnapshotService();
-            output = captureStdout(() -> snapshots.runTurn(mode.name().toLowerCase(), input, () -> switch (mode) {
-                    case REACT -> reactAgent.run(input);
-                    case PLAN -> new PlanExecuteAgent(
-                            llmClient,
-                            reactAgent.getToolRegistry(),
-                            reactAgent.getMemoryManager(),
-                            (goal, plan) -> PlanExecuteAgent.PlanReviewDecision.execute()
-                    ).run(input);
-                    case TEAM -> new AgentOrchestrator(
-                            llmClient,
-                            reactAgent.getToolRegistry(),
-                            reactAgent.getMemoryManager()
-                    ).run(input);
-                }));
-        } catch (Exception e) {
-            output = "执行失败: " + (e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+            CancellationToken token = CancellationContext.startRun();
+            currentToken = token;
+            statusPane.startTimer();
+            statusPane.updateMode(mode.label);
+            appendSystem(mode.label + " 运行中...");
+            String output;
+            try {
+                SnapshotService snapshots = reactAgent.getToolRegistry().getSnapshotService();
+                output = captureStdout(() -> snapshots.runTurn(mode.name().toLowerCase(), input, () -> switch (mode) {
+                        case REACT -> reactAgent.run(input);
+                        case PLAN -> new PlanExecuteAgent(
+                                llmClient,
+                                reactAgent.getToolRegistry(),
+                                reactAgent.getMemoryManager(),
+                                (goal, plan) -> PlanExecuteAgent.PlanReviewDecision.execute()
+                        ).run(input);
+                        case TEAM -> new AgentOrchestrator(
+                                llmClient,
+                                reactAgent.getToolRegistry(),
+                                reactAgent.getMemoryManager()
+                        ).run(input);
+                    }));
+            } catch (Exception e) {
+                output = "执行失败: " + (e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+            } finally {
+                CancellationContext.clear(token);
+                currentToken = null;
+                ui(() -> {
+                    statusPane.stopTimer();
+                    statusPane.updateMode("ReAct");
+                });
+            }
+            appendAssistant(cleanOutput(output));
         } finally {
-            CancellationContext.clear(token);
-            currentToken = null;
-            ui(() -> {
-                statusPane.stopTimer();
-                statusPane.updateMode("ReAct");
-            });
+            // Future.cancel(true) can report done before the callable has actually exited.
+            // Keep /clear blocked until the final assistant/history write is also complete.
+            activeRun.set(false);
         }
-        appendAssistant(cleanOutput(output));
     }
 
     private String formatSnapshots() {
@@ -354,7 +382,7 @@ public final class TuiSessionController implements AutoCloseable {
 
     private boolean isTaskRunning() {
         Future<?> task = currentTask;
-        return task != null && !task.isDone();
+        return activeRun.get() || (task != null && !task.isDone());
     }
 
     private void appendUser(String message) {

@@ -108,9 +108,11 @@ public class MemoryManager {
      * 添加工具执行结果到短期记忆（截断过长结果，避免快速撑满预算）
      */
     public void addToolResult(String toolName, String result) {
-        String truncated = result.length() > MAX_TOOL_RESULT_CHARS
-                ? result.substring(0, MAX_TOOL_RESULT_CHARS) + "...(已截断)"
-                : result;
+        String value = result == null ? "" : result;
+        int codePoints = value.codePointCount(0, value.length());
+        String truncated = codePoints > MAX_TOOL_RESULT_CHARS
+                ? value.substring(0, value.offsetByCodePoints(0, MAX_TOOL_RESULT_CHARS)) + "...(已截断)"
+                : value;
         String content = "[" + toolName + "] " + truncated;
         MemoryEntry entry = new MemoryEntry(
                 "tool-" + UUID.randomUUID().toString().substring(0, 8),

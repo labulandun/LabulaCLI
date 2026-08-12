@@ -96,6 +96,7 @@ class ToolCallRendererTest {
         assertEquals("📖 读取 1 个文件", ToolCallRenderer.toolLabel("read_file", 1));
         assertEquals("✏️ 写入 2 个文件", ToolCallRenderer.toolLabel("write_file", 2));
         assertEquals("⚡ 执行 1 条命令", ToolCallRenderer.toolLabel("execute_command", 1));
+        assertEquals("📦 读取 1 个工具结果分片", ToolCallRenderer.toolLabel("read_tool_result", 1));
     }
 
     @Test
@@ -108,6 +109,13 @@ class ToolCallRendererTest {
     void extractKeyParamPullsOutPath() {
         assertEquals("README.md",
                 ToolCallRenderer.extractKeyParam("read_file", "{\"path\":\"README.md\"}"));
+    }
+
+    @Test
+    void extractKeyParamPullsOutArtifactHandle() {
+        assertEquals("tool-result://session/artifact",
+                ToolCallRenderer.extractKeyParam(
+                        "read_tool_result", "{\"handle\":\"tool-result://session/artifact\"}"));
     }
 
     @Test

@@ -661,8 +661,9 @@ public class Main {
 
                         // 同步项目路径到 ToolRegistry，让 search_code 工具可以正常工作
                         String absPath = new File(indexPath).getAbsolutePath();
-                        reactAgent.getToolRegistry().setProjectPath(absPath);
-                        reactAgent.getMemoryManager().setProjectPath(absPath);
+                        if (reactAgent.switchProjectPath(absPath)) {
+                            ui.println("🔄 项目作用域已切换：已清空旧对话并轮换工具结果工件会话");
+                        }
                         continue;
                     }
                     case SEARCH_CODE -> {

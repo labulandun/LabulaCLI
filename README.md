@@ -8,6 +8,15 @@
 - Provider 熔断按 `provider + model + endpoint` 隔离，默认 60 秒窗口内 3 次故障 OPEN 30 秒，再以 1 个 HALF_OPEN 探针恢复；OPEN 时快速失败，当前不自动切换 Provider
 - 配置支持 `-D` 系统属性、环境变量、进程当前工作目录 `.env`、`~/.env`，详见 `.env.example`；评测参数 `--timeout` / `--max-run-seconds` 是外围门禁，不代替产品 Deadline
 
+### Phase 90.1：可恢复工具结果工件
+
+- ReAct、Plan task、Worker SubAgent 的文本工具结果统一经过模型投影：小结果保持原样；达到估算 4,096 tokens 的大结果写入 `~/.paicli/context-artifacts/<project-hash>/<session-id>/`，历史只保留固定 head/tail 预览、SHA-256、session manifest 与 `tool-result://...` handle
+- 新增只读 `read_tool_result`，使用 Unicode code-point `offset` 分片读取（默认 12,000、单次最多 24,000）；嵌套 Explorer 共享同一项目/会话 scope，`/clear` 会轮换 scope 并使旧 handle 失效；`/index` 切换项目根时同步清空旧上下文与旧 scope
+- 工件相对于 `ToolRegistry` 已收到的文本可恢复；命令/Web/MCP 上游已经截断的内容不能恢复，图片与超大 tool-call arguments 也不在本阶段工件化范围内
+- 默认单工件 32 MiB、会话 256 MiB、保留 7 天；写盘或配额失败只返回有界失败预览，绝不把大原文重新塞回上下文。工件是本机明文文件，可能包含敏感输出，请按需调整目录与留存时间
+- `/context` 会显示当前 session 的 artifact 文件数、正文体积与 manifest handle，便于确认落盘状态和恢复入口
+- 配置项：`PAICLI_TOOL_RESULT_DIR`、`PAICLI_TOOL_RESULT_SPILL_TOKENS`、`PAICLI_TOOL_RESULT_RETENTION_DAYS`（及同名 `paicli.tool.result.*` 系统属性）；详细设计见 `docs/phase-90-recoverable-context-compaction.md`
+
 ### Side-Git 快照隔离
 
 - 快照使用 `~/.paicli/snapshots/<project_hash>/<worktree_hash>/.git` 下的 bare JGit 仓库，不把真实项目绑定为 Git worktree

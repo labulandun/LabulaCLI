@@ -8,6 +8,7 @@ import com.paicli.plan.ExecutionPlan;
 import com.paicli.plan.Planner;
 import com.paicli.plan.Task;
 import com.paicli.tool.ToolRegistry;
+import com.paicli.tool.ToolResultArtifactStore;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -172,6 +173,47 @@ class PlanExecuteAgentTest {
         assertTrue(rendered.contains("任务输出 [task_1]"));
         assertFalse(rendered.contains("任务结果 [task_1]"),
                 "tool-call 前后的流式 content 不应被误标成任务结果: " + rendered);
+    }
+
+    @Test
+    void shouldKeepToolOnlyFallbackBoundedWhenToolResultSpills() throws Exception {
+        String raw = "PLAN-RAW-" + "x".repeat(300_000);
+        ToolResultArtifactStore store = new ToolResultArtifactStore(
+                tempDir.resolve("plan-artifacts"), tempDir, 1, 7);
+        ToolRegistry toolRegistry = new ToolRegistry(store) {
+            @Override
+            public String executeTool(String name, String argumentsJson) {
+                if ("large_plan_tool".equals(name)) {
+                    return raw;
+                }
+                return super.executeTool(name, argumentsJson);
+            }
+        };
+        toolRegistry.setProjectPath(tempDir.toString());
+        StubGLMClient llmClient = new StubGLMClient(List.of(
+                new LlmClient.ChatResponse(
+                        "assistant",
+                        "",
+                        List.of(new LlmClient.ToolCall(
+                                "call_large",
+                                new LlmClient.ToolCall.Function("large_plan_tool", "{}"))),
+                        100,
+                        10),
+                new LlmClient.ChatResponse("assistant", "", null, 100, 10)
+        ));
+        PlanExecuteAgent agent = new PlanExecuteAgent(
+                llmClient,
+                toolRegistry,
+                new StubPlanner(llmClient),
+                null,
+                (goal, plan) -> PlanExecuteAgent.PlanReviewDecision.execute());
+
+        String result = agent.run("执行大结果工具");
+
+        assertTrue(result.contains("artifact_manifest: tool-result://"));
+        assertTrue(result.contains("handle: tool-result://"));
+        assertTrue(result.length() < 30_000);
+        assertFalse(result.contains(raw));
     }
 
     private record StubResponse(LlmClient.ChatResponse response, boolean streamContent,

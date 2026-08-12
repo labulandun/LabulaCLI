@@ -257,7 +257,11 @@ LLM 生成计划 JSON / 简单任务最小计划 / 重编号 task_1..N / 依赖�
 DAG 拓扑排序 / 可执行任务判定 / 进度可视化
 
 ### ToolRegistry.java
-11 个核心内置工具 + MCP 动态工具 / executeTools() 并行入口 / ToolInvocation / ToolExecutionResult。代码理解默认路径是 `glob_files` / `grep_code` / `read_file` 现用现查，`grep_code` 优先走 ripgrep 并按 `max_results` / `head_limit` / `max_chars` 渐进返回，`search_code` 保留为 RAG 语义辅助。确定性搜索链路的回归样例见 `docs/code-search-golden-set.md`。
+内置工具 + MCP 动态工具 / executeTools() 并行入口 / ToolInvocation / ToolExecutionResult。Phase 90.1 在顶层 `executeTracedInvocation` 完成原始工具执行后统一生成模型投影：超过阈值的文本落为 UTF-8 工件，`result()` 只带预览、digest、manifest 和 opaque handle；`displayPreview` / `resultMetadata` 服务 UI 与 partial 判断，图片 parts 保持独立。`read_tool_result` 严格分页且 spill-exempt，`readOnlyExploreView()` 共享主 session store。代码理解默认路径是 `glob_files` / `grep_code` / `read_file` 现用现查，`grep_code` 优先走 ripgrep 并按 `max_results` / `head_limit` / `max_chars` 渐进返回，`search_code` 保留为 RAG 语义辅助。确定性搜索链路的回归样例见 `docs/code-search-golden-set.md`。
+
+工具工件默认目录为 `~/.paicli/context-artifacts/<project-hash>/<session-id>/`；单工件 32 MiB、session 256 MiB、保留 7 天（成功读取会刷新 session 访问时间，启动时清理超过留存期且未访问的旧目录）。配置读取遵循 system property > environment > 项目 `.env` > 用户 `~/.env` > 默认值：`paicli.tool.result.dir` / `.spill.tokens` / `.retention.days`。工件正文不自动脱敏且是本机明文；producer 在 ToolRegistry 之前已经截断的内容不属于可恢复承诺。
+
+`/index <新路径>` 改变项目根时会同步清空旧 conversation history/short-term memory 并切换 artifact session，避免旧项目句柄进入新 scope 后反复读取失败。
 
 ### MCP Package
 McpServerManager / McpClient / JsonRpcClient / StdioTransport / StreamableHttpTransport / McpSchemaSanitizer / resources/ / mention/ / notifications/
