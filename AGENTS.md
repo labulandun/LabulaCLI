@@ -13,7 +13,7 @@
 - 项目名：`PaiCLI`
 - 定位：面向商业使用的 Java Agent CLI 产品，对标 Claude Code
 - 已交付 21 期（ReAct → Plan+DAG → Memory → RAG → Multi-Agent → HITL → 并行工具 → 多模型 → 联网 → MCP 核心 → MCP 高级 → 长上下文 → Chrome DevTools → CDP 会话复用 → Skill → TUI → LSP 诊断 → Side-Git 快照 → Prompt 分层 → Runtime API → 图片输入）
-- 长上下文改进 Phase 90.1 已交付：大文本工具结果统一落为 UTF-8 工件，conversationHistory 仅保存有界预览/摘要元数据/`tool-result://` handle；`read_tool_result` 支持按 Unicode code point 分页恢复，ReAct/Plan/Worker/freshness/Explore 共用同一投影协议
+- 长上下文改进 Phase 90.1–90.2 已交付：大文本工具结果统一落为 UTF-8 工件，source history 仅保存有界预览/摘要元数据/`tool-result://` handle；`read_tool_result` 支持按 Unicode code point 分页恢复；ReAct/Plan/Worker 的压缩只生成不可变 model view，不再用摘要覆盖 source history
 - OpenTelemetry / Langfuse ReAct MVP 已接入：根 observation、generation、tool、并行上下文、Runtime trace ID 回传、退出 flush；Plan / Team / 独立 SubAgent 尚未覆盖
 - 评测体系 Phase E1–E4 已交付：`com.paicli.eval.EvalMain` 黑盒驱动 `serve --http` 子进程，覆盖 custom（10）/ tool-golden（5）/ safety（8）/ terminal（5）/ swe-lite（10）；artifact 聚合 llm/tool/audit 明细与 tokens/rounds/tool_error_rate，`SandboxExecutor` 分 host/docker 两档，Docker 不可用时 docker 用例 skip 不降级
 - Phase E4 支持 case/run 级并发、`--runs` 覆盖、固定 pass@1/pass@3（含 coverage）、`--max-run-seconds` 总耗时预算；swe-lite 隐藏 fail-to-pass/pass-to-pass 测试固定 UTF-8。2026-08-03 本机 Docker 全量实跑 15 case × 3：43/45 run 通过，pass@1=14/15，pass@3=15/15，总耗时 688.758 秒；详见 `docs/evaluation-system-design.md`
@@ -93,7 +93,7 @@ src/main/java/com/paicli/
 - inline 模式使用 JLine 4 的 LineReader 编辑能力，默认提示符是 `* `，右提示显示 `message / @path / @image`。
 - 默认 CLI 启动路径应先 `Renderer.start()` 并初始化底部 dock；inline 首屏不要在 `readLine` 前裸写 stdout，而是通过 `InlineRenderer.installStartupScreen(...)` 挂到 `LineReader.CALLBACK_INIT`，首次进入输入时用 `printAbove` 一次性显示完整 Banner + tips，避免 logo 被 LineReader 首次重绘滚出可视区域。
 - `BottomStatusBar` 现在是 JLine `Status` 托管的底部 dock：由 JLine 维护滚动区域和状态行位置，不再手写 `\n` / `moveUp` / `CLEAR_TO_EOS` 清屏。输入期会把 LineReader 光标定位到 dock 上方一行，让 `*` 输入行和 Status 同处底部区域；dock 保留两类信息：上层模式 + MCP/Skill 摘要，下层 Auto Model / model / phase / ctx 百分比与 token / cost / elapsed / cwd。`ctx` 表示当前仍会带入下一轮请求的上下文估算；`in/out/cache` 表示最近任务的 LLM 调用统计，二者不要混用。
-- 普通任务和斜杠命令提交后，`Main` 会把本轮原始输入以暗色整行块写回 transcript：输入态左提示仍是 `* `，提交回显左提示改为 `>`；单行输入只占一行，不额外追加空白行。普通任务随后再展开 MCP resource / 本地 `@path` 并进入 Agent；不要只依赖 JLine 提交行残留，否则 activity 重绘或 dock 刷新可能让用户输入从可见历史里消失。`/clear` 清空 conversationHistory、shortTermMemory、待注入 Skill buffer，轮换工具结果 artifact session，并重建不含上一轮检索记忆的 system prompt；长期记忆保留。
+- 普通任务和斜杠命令提交后，`Main` 会把本轮原始输入以暗色整行块写回 transcript：输入态左提示仍是 `* `，提交回显左提示改为 `>`；单行输入只占一行，不额外追加空白行。普通任务随后再展开 MCP resource / 本地 `@path` 并进入 Agent；不要只依赖 JLine 提交行残留，否则 activity 重绘或 dock 刷新可能让用户输入从可见历史里消失。`/clear` 清空 source conversationHistory、projection state、shortTermMemory、待注入 Skill buffer，轮换工具结果 artifact session，并重建不含上一轮检索记忆的 system prompt；长期记忆保留。
 - `/index` 切换到不同项目根时同步清空旧 conversation history/shortTermMemory 并切换工具结果 artifact scope，旧项目 handle 不进入新项目请求。
 - ReAct LLM 调用期间，inline renderer 使用固定高度 live thinking 区动态显示 `Thinking...` 和灰色竖线 reasoning 预览；该区域只能清理自己刚打印的几行，不能用独立 JLine `Display.update()` / `CLEAR_TO_EOS` 向上覆盖 transcript。content 或 tool call 开始前先清掉 live 区，再把完整 reasoning 引用块落到正文区，正文回答用低调标记起始，不再刷强标题。
 - 交互期输出应优先走 `Renderer.stream()`；`Main`、`PlanExecuteAgent`、`Planner`、`AgentOrchestrator` 都支持把输出流接到 inline renderer，避免直接争抢 stdout。`CodeIndex` 的索引进度通过 `ProgressListener` 注入，`/index` 应绑定到当前 renderer 输出流。
@@ -117,6 +117,9 @@ src/main/java/com/paicli/
 - 长期记忆必须可审计和可删除：`/memory list` / `/memory search <关键词>` / `/memory delete <id>` / `/memory clear`
 - 两道压缩不要混淆：shortTermMemory 压缩 vs conversationHistory 压缩（后者是防 window 超限的关键）
 - Phase 90.1 先处理工具文本正文：达到阈值的结果在进入 history 前即替换为预览 + handle；`read_tool_result` 单次最多读取 24,000 code points，不能用文件路径绕过 session scope
+- Phase 90.2 把 conversationHistory 明确为 source history：压缩器只返回不可变 model view 与 checkpoint；三条业务 LLM 路径只发送 model view，`getConversationHistory()` 不得返回摘要替换后的派生列表
+- 摘要 checkpoint 的 prefix digest 排除动态 system[0]，但覆盖其余消息的 role/content/contentParts、tool call id/name/arguments、tool_call_id 和 reasoning；append baseline 拒绝 retained tail 的插入/删除/重排/覆盖；图片裁剪必须先于 checkpoint 校验，manifest 内容增长只刷新 model view 的动态 artifact index
+- Phase 90.3 的完整请求 accounting/hard ceiling 尚未交付；当前不要把消息级压缩阈值描述为已覆盖 tools schema、回复预留或完整请求预算
 
 ### HITL + 策略层
 
@@ -238,6 +241,7 @@ src/main/java/com/paicli/
 Phase E3 的 Docker 沙盒**只用于评测 harness**（`com.paicli.eval.DockerExecutor`），不是产品运行时沙箱：日常 CLI 使用仍然是「HITL + 路径校验 + 命令快速拒绝 + 审计」，没有进程隔离。不要把两者混为一谈。`RuntimeApiServer` 的 `PAICLI_RUNTIME_API_HOST` 默认 `127.0.0.1`，只有容器场景才应放开。
 OpenTelemetry 当前业务埋点只覆盖 ReAct 主路径；Plan / Team / 独立 SubAgent 不能误报为已覆盖。Score 通过 Langfuse Scores API 写入，不作为 OTLP span 伪造。
 Phase 90.1 只工件化 `ToolRegistry` 边界收到的文本结果：producer 上游截断、图片 payload、MCP resource mention、用户内联文件和 tool-call arguments 不在可恢复正文承诺内；工件默认不做 secret redaction。
+Phase 90.2 保留完整 source history 仅限当前进程/任务生命周期，不新增 Runtime 会话持久化；摘要失败时可以回退到完整 source view，因此在 Phase 90.3 hard ceiling 落地前仍可能由 provider 报 context length。
 
 不要把 `ROADMAP.md` 中"将来要做"误读成"现在已有"。
 

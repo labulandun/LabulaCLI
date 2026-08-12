@@ -8,6 +8,8 @@ import com.paicli.llm.LlmTimeoutException;
 import com.paicli.llm.LlmTraceLogger;
 import com.paicli.lsp.LspDiagnosticReport;
 import com.paicli.memory.ConversationHistoryCompactor;
+import com.paicli.memory.HistoryProjectionResult;
+import com.paicli.memory.HistoryProjectionState;
 import com.paicli.context.ContextProfile;
 import com.paicli.prompt.PromptAssembler;
 import com.paicli.prompt.PromptContext;
@@ -53,6 +55,8 @@ public class SubAgent {
     private SkillRegistry skillRegistry;
     private SkillContextBuffer skillContextBuffer;
     private final ConversationHistoryCompactor historyCompactor;
+    private HistoryProjectionState historyProjectionState = HistoryProjectionState.empty();
+    private List<LlmClient.Message> lastModelConversationView = List.of();
     private final PromptAssembler promptAssembler = PromptAssembler.createDefault();
 
     public SubAgent(String name, AgentRole role, LlmClient llmClient, ToolRegistry toolRegistry) {
@@ -98,17 +102,37 @@ public class SubAgent {
         };
     }
 
-    private void maybeCompactHistory(PrintStream out) {
-        if (historyCompactor == null) return;
+    private HistoryProjectionResult projectHistory(PrintStream out) {
         ContextProfile profile = toolRegistry == null ? null : toolRegistry.getContextProfile();
-        if (profile == null) return;
+        int trigger = profile == null ? Integer.MAX_VALUE : profile.compressionTriggerTokens();
         try {
-            boolean compacted = historyCompactor.compactIfNeeded(conversationHistory, profile.compressionTriggerTokens());
-            if (compacted && out != null) {
+            HistoryProjectionResult projection = historyCompactor.project(
+                    conversationHistory,
+                    historyProjectionState,
+                    trigger,
+                    shouldUseTools()
+                            ? toolRegistry.getToolResultArtifactIndex()
+                            : com.paicli.tool.ToolResultArtifactIndex.empty());
+            if (projection.checkpointAdvanced() && out != null) {
                 out.println("📦 [" + name + "] 上下文接近窗口上限，已把早期对话压缩为摘要后继续。");
             }
+            historyProjectionState = projection.nextState();
+            return projection;
         } catch (Exception e) {
-            log.warn("[{}] conversationHistory compaction failed", name, e);
+            log.warn("[{}] conversationHistory projection failed; using immutable source snapshot", name, e);
+            List<LlmClient.Message> sourceSnapshot = List.copyOf(conversationHistory);
+            int tokens = com.paicli.memory.TokenBudget.estimateMessagesTokens(sourceSnapshot);
+            return new HistoryProjectionResult(
+                    sourceSnapshot,
+                    historyProjectionState,
+                    false,
+                    false,
+                    0,
+                    0,
+                    "",
+                    tokens,
+                    tokens,
+                    true);
         }
     }
 
@@ -200,13 +224,14 @@ public class SubAgent {
 
             budget.beginIteration();
 
-            // 调 LLM 前评估 conversationHistory 是否接近 window 上限；超阈值压缩早期消息为摘要。
+            // source history 始终保留；这里只构建本轮不可变 model view。
             injectPendingLspDiagnostics(out);
-            maybeCompactHistory(out);
+            HistoryProjectionResult projection = projectHistory(out);
 
             try {
+                lastModelConversationView = projection.modelMessages();
                 LlmClient.ChatResponse response = llmClient.chat(
-                        conversationHistory,
+                        lastModelConversationView,
                         shouldUseTools() ? toolRegistry.getToolDefinitions() : null,
                         streamRenderer
                 );
@@ -303,6 +328,26 @@ public class SubAgent {
         LlmClient.Message systemMsg = conversationHistory.get(0);
         conversationHistory.clear();
         conversationHistory.add(systemMsg);
+        historyProjectionState = HistoryProjectionState.empty();
+        lastModelConversationView = List.of();
+    }
+
+    /** Source conversation snapshot; summaries are never written into this list. */
+    public List<LlmClient.Message> getConversationHistory() {
+        return new ArrayList<>(conversationHistory);
+    }
+
+    /** Last immutable message list handed to this sub-agent's business LLM call. */
+    public List<LlmClient.Message> getLastModelConversationView() {
+        return List.copyOf(lastModelConversationView);
+    }
+
+    public List<LlmClient.Message> getModelConversationView() {
+        return getLastModelConversationView();
+    }
+
+    public HistoryProjectionState getHistoryProjectionState() {
+        return historyProjectionState;
     }
 
     private void pruneHistoricalImagePayloads() {

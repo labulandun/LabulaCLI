@@ -9,6 +9,8 @@ import com.paicli.context.TokenUsageFormatter;
 import com.paicli.lsp.LspDiagnosticReport;
 import com.paicli.memory.ConversationHistoryCompactor;
 import com.paicli.memory.ExplicitMemoryHints;
+import com.paicli.memory.HistoryProjectionResult;
+import com.paicli.memory.HistoryProjectionState;
 import com.paicli.memory.MemoryManager;
 import com.paicli.observability.PaiCliTracing;
 import com.paicli.prompt.PromptAssembler;
@@ -74,6 +76,8 @@ public class Agent {
     private final List<LlmClient.Message> conversationHistory;
     private final MemoryManager memoryManager;
     private final ConversationHistoryCompactor historyCompactor;
+    private HistoryProjectionState historyProjectionState = HistoryProjectionState.empty();
+    private List<LlmClient.Message> lastModelConversationView = List.of();
     private Supplier<String> externalContextSupplier = () -> "";
     private SkillRegistry skillRegistry;
     private SkillContextBuffer skillContextBuffer;
@@ -151,6 +155,8 @@ public class Agent {
         this.llmClient = tracing.traceLlmClient(llmClient);
         this.memoryManager.setLlmClient(this.llmClient);
         this.historyCompactor.setLlmClient(this.llmClient);
+        this.historyProjectionState = HistoryProjectionState.empty();
+        this.lastModelConversationView = List.of();
         this.toolRegistry.setContextProfile(memoryManager.getContextProfile());
         this.toolRegistry.setCurrentModel(this.llmClient.getProviderName(), this.llmClient.getModelName());
     }
@@ -263,11 +269,9 @@ public class Agent {
                         timedOut ? "全链路 Deadline 已耗尽" : "用户在迭代开始前取消");
                 return CancellationContext.stopMessage("当前任务");
             }
-            // 调 LLM 前评估 conversationHistory 是否接近 window 上限；超阈值就把早期消息压缩成摘要。
-            // 这是与第 3 期 Memory 短期记忆压缩并行的另一道压缩——后者只压 shortTermMemory，
-            // 真正决定下一轮 LLM input token 的是这里。
+            // 先向 source history 注入本轮诊断，再基于 source 构建不可变 model view。
             injectPendingLspDiagnostics();
-            maybeCompactHistory();
+            HistoryProjectionResult projection = projectHistory();
             AgentBudget.ExitReason exitReason = budget.check();
             if (exitReason != AgentBudget.ExitReason.WITHIN_BUDGET) {
                 String description = budget.describeExit(exitReason);
@@ -283,11 +287,13 @@ public class Agent {
 
             try {
                 List<LlmClient.Tool> toolDefinitions = toolRegistry.getToolDefinitions();
-                logRequestContext("react iteration=" + iteration, toolDefinitions);
+                lastModelConversationView = projection.modelMessages();
+                logRequestContext("react iteration=" + iteration, toolDefinitions,
+                        lastModelConversationView);
                 streamRenderer.beginThinking();
                 // 调用 LLM
                 LlmClient.ChatResponse response = llmClient.chat(
-                        conversationHistory,
+                        lastModelConversationView,
                         toolDefinitions,
                         streamRenderer
                 );
@@ -417,6 +423,8 @@ public class Agent {
     private void resetConversationState(boolean rotateArtifactSession) {
         conversationHistory.clear();
         conversationHistory.add(LlmClient.Message.system(buildSystemPrompt("")));
+        historyProjectionState = HistoryProjectionState.empty();
+        lastModelConversationView = List.of();
         if (rotateArtifactSession) {
             toolRegistry.clearToolResultArtifacts();
         }
@@ -456,16 +464,34 @@ public class Agent {
                 .build());
     }
 
-    private void maybeCompactHistory() {
-        if (historyCompactor == null) return;
+    private HistoryProjectionResult projectHistory() {
         int trigger = memoryManager.getContextProfile().compressionTriggerTokens();
         try {
-            boolean compacted = historyCompactor.compactIfNeeded(conversationHistory, trigger);
-            if (compacted) {
+            HistoryProjectionResult projection = historyCompactor.project(
+                    conversationHistory,
+                    historyProjectionState,
+                    trigger,
+                    toolRegistry.getToolResultArtifactIndex());
+            if (projection.checkpointAdvanced()) {
                 renderer().stream().println("📦 上下文接近窗口上限，已把早期对话压缩为摘要后继续。");
             }
+            historyProjectionState = projection.nextState();
+            return projection;
         } catch (Exception e) {
-            log.warn("conversationHistory compaction failed", e);
+            log.warn("conversationHistory projection failed; using immutable source snapshot", e);
+            List<LlmClient.Message> sourceSnapshot = List.copyOf(conversationHistory);
+            int tokens = com.paicli.memory.TokenBudget.estimateMessagesTokens(sourceSnapshot);
+            return new HistoryProjectionResult(
+                    sourceSnapshot,
+                    historyProjectionState,
+                    false,
+                    false,
+                    0,
+                    0,
+                    "",
+                    tokens,
+                    tokens,
+                    true);
         }
     }
 
@@ -671,6 +697,20 @@ public class Agent {
         return new ArrayList<>(conversationHistory);
     }
 
+    /** Last immutable message list actually handed to the business LLM call. */
+    public List<LlmClient.Message> getLastModelConversationView() {
+        return List.copyOf(lastModelConversationView);
+    }
+
+    /** Compatibility alias for tests and diagnostics that do not need the "last" qualifier. */
+    public List<LlmClient.Message> getModelConversationView() {
+        return getLastModelConversationView();
+    }
+
+    public HistoryProjectionState getHistoryProjectionState() {
+        return historyProjectionState;
+    }
+
     /**
      * 获取记忆管理器
      */
@@ -694,10 +734,11 @@ public class Agent {
         int window = profile.maxContextWindow();
         int triggerTokens = profile.compressionTriggerTokens();
 
-        // 分类估算 token 占用
+        List<LlmClient.Message> contextView = currentEstimatedModelView(profile);
+        // 分类估算下一轮可用 model-view candidate；完整 request accounting 留给 Phase 90.3。
         int systemTokens = 0, userTokens = 0, assistantTokens = 0, toolTokens = 0;
         int systemCount = 0, userCount = 0, assistantCount = 0, toolCount = 0;
-        for (LlmClient.Message msg : conversationHistory) {
+        for (LlmClient.Message msg : contextView) {
             int t = com.paicli.memory.TokenBudget.estimateMessagesTokens(java.util.List.of(msg));
             switch (msg.role()) {
                 case "system" -> { systemTokens += t; systemCount++; }
@@ -771,11 +812,26 @@ public class Agent {
     }
 
     private long estimateCurrentContextTokens() {
-        long messageTokens = com.paicli.memory.TokenBudget.estimateMessagesTokens(conversationHistory);
+        long messageTokens = com.paicli.memory.TokenBudget.estimateMessagesTokens(
+                currentEstimatedModelView(memoryManager.getContextProfile()));
         return Math.max(0L, messageTokens + estimateToolsSchemaTokens());
     }
 
-    private void logRequestContext(String scope, List<LlmClient.Tool> tools) {
+    private List<LlmClient.Message> currentEstimatedModelView(ContextProfile profile) {
+        try {
+            return historyCompactor.previewModelMessages(
+                    conversationHistory,
+                    historyProjectionState,
+                    profile.compressionTriggerTokens(),
+                    toolRegistry.getToolResultArtifactIndex());
+        } catch (RuntimeException e) {
+            log.debug("failed to build model-view context preview; using immutable source snapshot", e);
+            return List.copyOf(conversationHistory);
+        }
+    }
+
+    private void logRequestContext(String scope, List<LlmClient.Tool> tools,
+                                   List<LlmClient.Message> requestMessages) {
         if (!log.isInfoEnabled()) {
             return;
         }
@@ -786,8 +842,9 @@ public class Agent {
         int imageParts = 0;
         int messages = 0;
         StringBuilder imageDetails = new StringBuilder();
-        for (int messageIndex = 0; messageIndex < conversationHistory.size(); messageIndex++) {
-            LlmClient.Message msg = conversationHistory.get(messageIndex);
+        List<LlmClient.Message> messagesToLog = requestMessages == null ? List.of() : requestMessages;
+        for (int messageIndex = 0; messageIndex < messagesToLog.size(); messageIndex++) {
+            LlmClient.Message msg = messagesToLog.get(messageIndex);
             messages++;
             int tokens = com.paicli.memory.TokenBudget.estimateMessagesTokens(List.of(msg));
             imageParts += msg.imagePartCount();

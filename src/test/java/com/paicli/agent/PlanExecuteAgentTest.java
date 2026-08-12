@@ -1,12 +1,15 @@
 package com.paicli.agent;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.paicli.llm.GLMClient;
 import com.paicli.llm.LlmClient;
 import com.paicli.memory.LongTermMemory;
 import com.paicli.memory.MemoryManager;
+import com.paicli.mcp.protocol.McpToolDescriptor;
 import com.paicli.plan.ExecutionPlan;
 import com.paicli.plan.Planner;
 import com.paicli.plan.Task;
+import com.paicli.tool.ToolOutput;
 import com.paicli.tool.ToolRegistry;
 import com.paicli.tool.ToolResultArtifactStore;
 import org.junit.jupiter.api.Test;
@@ -24,6 +27,7 @@ import java.util.Queue;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class PlanExecuteAgentTest {
@@ -216,6 +220,49 @@ class PlanExecuteAgentTest {
         assertFalse(result.contains(raw));
     }
 
+    @Test
+    void taskUsesProjectedModelViewAndDropsImagesAndCheckpointBeforeNextTask() throws Exception {
+        ToolResultArtifactStore store = new ToolResultArtifactStore(
+                tempDir.resolve("plan-projection-artifacts"), tempDir, 100_000, 7);
+        ToolRegistry registry = new ToolRegistry(store);
+        registry.setProjectPath(tempDir.toString());
+        String imagePayload = "A".repeat(3_000_000);
+        registry.registerMcpToolOutput(new McpToolDescriptor(
+                        "demo",
+                        "image",
+                        "mcp__demo__image",
+                        "returns a test image",
+                        new ObjectMapper().readTree("{\"type\":\"object\",\"properties\":{}}")),
+                ignored -> new ToolOutput(
+                        "image result",
+                        List.of(LlmClient.ContentPart.imageBase64(imagePayload, "image/png"))));
+        ImageProjectionClient client = new ImageProjectionClient();
+        PlanExecuteAgent agent = new PlanExecuteAgent(
+                client,
+                registry,
+                new StubPlanner(client),
+                null,
+                (goal, plan) -> PlanExecuteAgent.PlanReviewDecision.execute());
+
+        assertTrue(agent.run("first image task").contains("计划执行完成"));
+
+        assertEquals(1, client.summaryCalls);
+        assertNotNull(client.firstTaskFinalRequest);
+        assertTrue(client.firstTaskFinalRequest.stream().anyMatch(message -> message.content() != null
+                && message.content().contains("[已压缩的历史对话摘要]")));
+        assertEquals(3, client.firstTaskFinalRequest.stream()
+                .mapToInt(LlmClient.Message::imagePartCount)
+                .sum(), "the three retained user rounds must keep their image payloads in-task");
+
+        assertTrue(agent.run("second clean task").contains("计划执行完成"));
+
+        assertEquals(1, client.summaryCalls, "a new Plan task must not reuse the old checkpoint");
+        assertNotNull(client.secondTaskRequest);
+        assertEquals(0, client.secondTaskRequest.stream().mapToInt(LlmClient.Message::imagePartCount).sum());
+        assertFalse(client.secondTaskRequest.stream().anyMatch(message -> message.content() != null
+                && message.content().contains("[已压缩的历史对话摘要]")));
+    }
+
     private record StubResponse(LlmClient.ChatResponse response, boolean streamContent,
                                 java.util.function.Consumer<LlmClient.StreamListener> streamScript) {
         private static StubResponse plain(LlmClient.ChatResponse response) {
@@ -280,6 +327,85 @@ class PlanExecuteAgentTest {
                 listener.onContentDelta(stubResponse.response().content());
             }
             return stubResponse.response();
+        }
+    }
+
+    private static final class ImageProjectionClient implements LlmClient {
+        private int firstTaskBusinessCalls;
+        private int summaryCalls;
+        private boolean firstTaskComplete;
+        private List<Message> firstTaskFinalRequest;
+        private List<Message> secondTaskRequest;
+
+        @Override
+        public ChatResponse chat(List<Message> messages, List<Tool> tools) throws IOException {
+            return chat(messages, tools, StreamListener.NO_OP);
+        }
+
+        @Override
+        public ChatResponse chat(List<Message> messages, List<Tool> tools, StreamListener listener) {
+            if (messages != null && !messages.isEmpty()
+                    && messages.get(0).content() != null
+                    && messages.get(0).content().contains("对话摘要助手")) {
+                summaryCalls++;
+                return new ChatResponse("assistant", validProjectionSummary(), null, 20, 10);
+            }
+            if (!firstTaskComplete) {
+                firstTaskBusinessCalls++;
+                if (firstTaskBusinessCalls <= 3) {
+                    return new ChatResponse(
+                            "assistant",
+                            "",
+                            List.of(new ToolCall(
+                                    "image-call-" + firstTaskBusinessCalls,
+                                    new ToolCall.Function("mcp__demo__image", "{}"))),
+                            20,
+                            10);
+                }
+                firstTaskComplete = true;
+                firstTaskFinalRequest = List.copyOf(messages);
+                return new ChatResponse("assistant", "first done", null, 20, 10);
+            }
+            secondTaskRequest = List.copyOf(messages);
+            return new ChatResponse("assistant", "second done", null, 20, 10);
+        }
+
+        @Override
+        public String getModelName() {
+            return "plan-projection-test";
+        }
+
+        @Override
+        public String getProviderName() {
+            return "test";
+        }
+
+        @Override
+        public int maxContextWindow() {
+            return 8_000;
+        }
+
+        private static String validProjectionSummary() {
+            return """
+                    ## Primary Request and Intent
+                    plan image task
+                    ## Current Work
+                    projected
+                    ## Pending Tasks
+                    无
+                    ## All User Messages
+                    已覆盖
+                    ## Key Technical Concepts
+                    image lifecycle
+                    ## Files and Code Sections
+                    无
+                    ## Problem Solving
+                    无
+                    ## Errors and Fixes
+                    无
+                    ## Optional Next Step
+                    继续
+                    """.trim();
         }
     }
 }

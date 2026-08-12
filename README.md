@@ -17,6 +17,16 @@
 - `/context` 会显示当前 session 的 artifact 文件数、正文体积与 manifest handle，便于确认落盘状态和恢复入口
 - 配置项：`PAICLI_TOOL_RESULT_DIR`、`PAICLI_TOOL_RESULT_SPILL_TOKENS`、`PAICLI_TOOL_RESULT_RETENTION_DAYS`（及同名 `paicli.tool.result.*` 系统属性）；详细设计见 `docs/phase-90-recoverable-context-compaction.md`
 
+### Phase 90.2：source history / model view 非破坏性分离
+
+- `ConversationHistoryCompactor` 不再用摘要原地替换 conversation history；ReAct、Plan task、Worker SubAgent 都从完整 source history 构造不可变 model view，业务响应、tool call 和 tool result 继续只追加到 source
+- 摘要 checkpoint 记录已覆盖边界、全字段 prefix digest 和 append baseline，并绑定摘要/retain 策略、provider/model、reasoning replay 模式和 artifact manifest scope；只有 source 尾部追加时才能复用，retained tail 改写或策略变化会重建
+- 连续压缩只总结上次 checkpoint 之后新覆盖的前缀，切割仍落在 user 边界并保留最近 3 个 user round；当前 system prompt 每轮直接进入 view，ReAct/SubAgent 图片会在 checkpoint 校验前按既有规则裁剪，Plan 图片只在本 task 内存活
+- 每个压缩 view 都确定性附加当前 artifact manifest、数量、最近 handle/digest 和 `read_tool_result` 恢复说明；manifest 内容增长只刷新动态索引，不会让旧摘要失效
+- 摘要为空、异常、超过 16,000 chars / 约 4,096 tokens 或调用失败时不修改 source、不提交新 checkpoint；有有效旧 checkpoint 时使用“旧摘要 + 完整当前 tail”，否则回退到当前 source 的不可变快照
+- `/clear`、项目切换、主 Agent 模型切换及 SubAgent/Plan 新任务会重置各自 projection state；`getConversationHistory()` 仍返回 source 快照，Agent/SubAgent 可用 `getLastModelConversationView()` 查看最近业务请求视图
+- 当前边界：Phase 90.2 仍沿用消息级启发式压缩阈值；tools wire schema、完整 reasoning/request framing、response reserve、安全余量与 hard ceiling 统一核算属于 Phase 90.3，尚未交付
+
 ### Side-Git 快照隔离
 
 - 快照使用 `~/.paicli/snapshots/<project_hash>/<worktree_hash>/.git` 下的 bare JGit 仓库，不把真实项目绑定为 Git worktree

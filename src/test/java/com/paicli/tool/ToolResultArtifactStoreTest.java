@@ -9,6 +9,8 @@ import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
 import java.security.MessageDigest;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.HexFormat;
@@ -93,6 +95,41 @@ class ToolResultArtifactStoreTest {
 
         assertTrue(store.read(oldHandle, 0, 100).startsWith("HANDLE_SCOPE_MISMATCH"));
         assertFalse(store.manifestHandle().equals(oldManifest));
+    }
+
+    @Test
+    void artifactIndexSnapshotIsBoundedNewestFirstAndClearedWithSession() throws Exception {
+        ToolResultArtifactStore store = new ToolResultArtifactStore(
+                tempDir.resolve("index-snapshot"), tempDir, 1, 7);
+        List<ToolResultArtifactRef> created = new ArrayList<>();
+        for (int i = 0; i < 25; i++) {
+            created.add(store.project(
+                    "demo-" + i, "call-index-" + i, ("payload-" + i).repeat(100), false)
+                    .artifactRef());
+        }
+
+        ToolResultArtifactIndex recentThree = store.artifactIndexSnapshot(3);
+        assertEquals(25, recentThree.artifactCount());
+        assertEquals(3, recentThree.recentArtifacts().size());
+        assertEquals(created.get(24).handle(), recentThree.recentArtifacts().get(0).handle());
+        assertEquals(created.get(22).handle(), recentThree.recentArtifacts().get(2).handle());
+
+        ToolResultArtifactIndex capped = store.artifactIndexSnapshot(Integer.MAX_VALUE);
+        assertEquals(ToolResultArtifactIndex.MAX_RECENT_ARTIFACTS,
+                capped.recentArtifacts().size());
+        String oldManifest = capped.manifestHandle();
+        Path oldSession = store.activeSessionDirectory();
+
+        store.clearSession();
+
+        ToolResultArtifactIndex cleared = store.artifactIndexSnapshot(Integer.MAX_VALUE);
+        assertEquals(0, cleared.artifactCount());
+        assertTrue(cleared.recentArtifacts().isEmpty());
+        assertFalse(oldManifest.equals(cleared.manifestHandle()));
+        for (int attempt = 0; attempt < 500 && Files.exists(oldSession); attempt++) {
+            Thread.sleep(10);
+        }
+        assertFalse(Files.exists(oldSession));
     }
 
     @Test

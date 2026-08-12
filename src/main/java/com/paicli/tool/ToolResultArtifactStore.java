@@ -24,8 +24,10 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Deque;
+import java.util.Iterator;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Set;
@@ -348,6 +350,24 @@ public final class ToolResultArtifactStore {
         return sessionId;
     }
 
+    /**
+     * Returns a bounded in-memory manifest snapshot without reading/touching artifact files.
+     * Recent entries are ordered newest first.
+     */
+    public synchronized ToolResultArtifactIndex artifactIndexSnapshot(int recentLimit) {
+        int limit = Math.max(0, Math.min(ToolResultArtifactIndex.MAX_RECENT_ARTIFACTS, recentLimit));
+        List<ToolResultArtifactRef> recent = new ArrayList<>(limit);
+        Iterator<ToolResultArtifactRef> iterator = manifestEntries.descendingIterator();
+        while (iterator.hasNext() && recent.size() < limit) {
+            recent.add(iterator.next());
+        }
+        return new ToolResultArtifactIndex(
+                manifestHandle(),
+                manifestEntries.size(),
+                ToolResultArtifactIndex.CURRENT_MANIFEST_SCHEMA_VERSION,
+                recent);
+    }
+
     /** Waits for active tool batches, rotates the session, then deletes the old scope asynchronously. */
     public void clearSession() {
         Path oldDirectory;
@@ -452,7 +472,8 @@ public final class ToolResultArtifactStore {
                                                String opaqueHandle, Path textPath)
             throws IOException {
         if (metadata == null || !metadata.isObject()
-                || metadata.path("schema_version").asInt(-1) != 1
+                || metadata.path("schema_version").asInt(-1)
+                        != ToolResultArtifactIndex.CURRENT_MANIFEST_SCHEMA_VERSION
                 || !artifactId.equals(metadata.path("artifact_id").asText())
                 || !opaqueHandle.equals(metadata.path("handle").asText())
                 || !("sha256:" + projectHash).equals(metadata.path("project_hash").asText())
@@ -544,7 +565,7 @@ public final class ToolResultArtifactStore {
 
     private byte[] metadataJson(ToolResultArtifactRef ref, ToolResultMetadata metadata) throws IOException {
         ObjectNode node = mapper.createObjectNode();
-        node.put("schema_version", 1);
+        node.put("schema_version", ToolResultArtifactIndex.CURRENT_MANIFEST_SCHEMA_VERSION);
         node.put("artifact_id", ref.artifactId());
         node.put("handle", ref.handle());
         node.put("project_hash", ref.projectHash());
@@ -571,7 +592,7 @@ public final class ToolResultArtifactStore {
 
     private String manifestContent() throws IOException {
         ObjectNode header = mapper.createObjectNode();
-        header.put("schema_version", 1);
+        header.put("schema_version", ToolResultArtifactIndex.CURRENT_MANIFEST_SCHEMA_VERSION);
         header.put("session_id", sessionId);
         header.put("manifest_handle", manifestHandle());
         StringBuilder manifest = new StringBuilder(mapper.writeValueAsString(header)).append('\n');

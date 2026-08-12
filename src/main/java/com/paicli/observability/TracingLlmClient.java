@@ -54,6 +54,11 @@ final class TracingLlmClient implements LlmClient {
         return delegate.promptCacheMode();
     }
 
+    @Override
+    public boolean replaysReasoningContent() {
+        return delegate.replaysReasoningContent();
+    }
+
     private ChatResponse trace(List<Message> messages, IoCall call) throws IOException {
         Span span = tracer.spanBuilder(PaiCliTracing.LLM_SPAN_NAME).startSpan();
         span.setAttribute(PaiCliTracing.ATTR_OBSERVATION_TYPE, "generation");

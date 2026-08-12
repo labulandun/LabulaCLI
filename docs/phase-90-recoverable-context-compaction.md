@@ -1,8 +1,8 @@
 # Phase 90：可恢复长上下文管理与非破坏性压缩设计
 
-> 状态：Phase 90.1 已于 2026-08-12 实现并通过定向回归；Phase 90.2（非破坏性历史投影）与 90.3（完整请求预算）尚未实现。
+> 状态：Phase 90.1 与 Phase 90.2 已于 2026-08-12 实现并通过定向回归；Phase 90.3（完整请求预算）尚未实现。
 > 本期定位：在不重做 Memory、Runtime 会话持久化和 provider tokenizer 的前提下，对现有长上下文链路做一个可独立验收的小版本改善。
-> 核心交付：大工具结果自动落盘并以句柄按需读取；压缩只生成 LLM 请求视图，不再替换源历史；压缩阈值改为完整请求级预算。
+> 核心交付：Phase 90.1–90.2 已完成大工具结果句柄化与非破坏性 LLM 请求视图；完整请求级预算属于 Phase 90.3。
 > 现有基础：Phase 12 的长上下文能力声明与 `ContextProfile`、Phase 24 的结构化 `ConversationHistoryCompactor` 摘要、三条路径共享的 `ToolRegistry.executeTools()`。
 
 ---
@@ -17,7 +17,7 @@
 |------|----------|--------------------|----------|
 | 工具自己的分页/截断 | 部分工具有限制，部分工具仍可返回无界文本 | 通常不能；内容在工具返回前已经丢弃 | 保留已有资源保护，并由通用 spill 覆盖未限制的返回边界 |
 | `ContextCompressor` / `shortTermMemory` | 工具结果先截到 500 字符，超预算后摘要短期记忆 | 不能作为原始对话恢复源 | 不改，继续负责 Memory 检索与短期摘要 |
-| `ConversationHistoryCompactor` | 达到 `window × 90%` 后，把旧消息替换为“摘要 + 最近消息” | 不能；原 `List<Message>` 被原地清空重建 | 改为只生成模型视图，源历史不被压缩器修改 |
+| `ConversationHistoryCompactor` | 达到当前消息级 trigger 后，从 source history 投影“摘要 + 最近消息” | source 不被摘要替换；工具正文另由 handle 恢复 | Phase 90.2 已改为只生成不可变模型视图，源历史不被压缩器修改 |
 
 现有 `explore_codebase` 已证明“把多轮工具噪声隔离在独立上下文，只回传精炼结论”是有效方向，但它只覆盖代码探索，且精炼结果仍是普通字符串，没有通用句柄和恢复能力。Phase 90 将可恢复的大结果处理下沉到统一工具结果边界，覆盖内置工具、MCP 工具和三条 Agent 路径。
 
@@ -132,7 +132,7 @@ ToolResultArtifactStore.project()
 3. **大结果正文不继续留在 `ToolExecutionResult`。** 落盘成功后，`result` 变成模型安全的 envelope，完整字符串在本轮包装完成后即可释放；同时保留有界 `displayPreview` 与结构化 `resultMetadata`，供 UI 摘要、`partial` 判断等非历史消费者使用，不能再靠解析完整 `result`。
 4. **压缩器返回 view，不改 source。** 源历史仍是后续摘要、调试和重新投影的事实来源；摘要 checkpoint 只是派生缓存。
 5. **预算按即将序列化的请求计算。** system prompt 已属于 messages，不再一边按实际内容计数、一边又固定扣一份 `reservedSystem`。
-6. **压缩是 soft trigger，发送是 hard ceiling。** soft trigger 允许提前生成摘要；超过 hard ceiling 且无法得到安全 view 时，必须受控失败，不能把 provider 的 context-length error 当作正常兜底。
+6. **压缩是 soft trigger，发送最终要有 hard ceiling。** Phase 90.2 已完成提前生成摘要；超过 hard ceiling 时的本地受控失败由 Phase 90.3 交付，当前仍可能收到 provider 的 context-length error。
 
 ### 2.2 建议代码结构
 
@@ -140,10 +140,12 @@ ToolResultArtifactStore.project()
 src/main/java/com/paicli/
 ├── context/
 │   ├── RequestContextEstimator.java       # 完整请求估算与判定
-│   ├── RequestContextBudget.java          # 分项结果、soft trigger、hard ceiling
-│   └── HistoryProjectionState.java        # 当前摘要 checkpoint / 最近 model view
+│   └── RequestContextBudget.java          # 分项结果、soft trigger、hard ceiling
 ├── memory/
-│   └── ConversationHistoryCompactor.java  # 从“原地修改”改为“返回投影视图”
+│   ├── ConversationHistoryCompactor.java  # 从“原地修改”改为“返回投影视图”
+│   ├── HistoryProjectionState.java        # 当前摘要 checkpoint
+│   ├── HistoryProjectionResult.java       # 不可变 model view + 投影元数据
+│   └── SummaryCheckpoint.java             # covered prefix 与策略身份
 └── tool/
     ├── ToolResultArtifactStore.java       # 原文写入、读取、清理、配额
     ├── ToolResultArtifactRef.java         # handle、长度、digest、创建时间
@@ -329,27 +331,47 @@ sha256: 3c2d...
 ```java
 final class ConversationState {
     List<LlmClient.Message> sourceHistory;       // 事实来源，不被 compactor 替换
-    HistoryProjectionState projectionState;      // 摘要 checkpoint + 最近一次 modelView
+    HistoryProjectionState projectionState;      // 摘要 checkpoint + append-only 观测
 }
 
+record HistoryProjectionState(
+    SummaryCheckpoint checkpoint,
+    int observedSystemEnd,
+    int observedSourceSize,
+    String observedSourceDigest
+) {}
+
 record SummaryCheckpoint(
+    int systemEnd,
     int coveredUntilExclusive,
     String coveredPrefixDigest,
+    int sourceSizeAtCheckpoint,
+    String sourceAppendBaselineDigest,
     String summary,
     String summaryPolicyVersion,
+    int retainRecentRounds,
     String provider,
     String model,
     boolean reasoningReplayEnabled,
-    String artifactManifestHandle
+    String artifactManifestHandle,
+    int artifactManifestSchemaVersion
 ) {}
 
-record ProjectionResult(
-    List<LlmClient.Message> modelView,
+record HistoryProjectionResult(
+    List<LlmClient.Message> modelMessages,
     HistoryProjectionState nextState,
-    RequestContextBudget accounting,
-    boolean compacted
+    boolean compacted,
+    boolean checkpointAdvanced,
+    int coveredFromInclusive,
+    int coveredUntilExclusive,
+    String coveredPrefixDigest,
+    int estimatedTokensBefore,
+    int estimatedTokensAfter,
+    boolean summaryFailed
 ) {}
 ```
+
+Phase 90.2 的 result 只记录消息级摘要前后估算；`RequestContextBudget` 会在 Phase 90.3 加入，当前不伪装成完整请求 accounting。
 
 这里的 `sourceHistory` 是“未被摘要替换的消息源”，不是绝对不可变的审计日志：
 
@@ -360,12 +382,12 @@ record ProjectionResult(
 
 Phase 90 的硬约束是：`ConversationHistoryCompactor` 不得再调用 `sourceHistory.clear()` 或用摘要覆盖源消息。
 
-`coveredPrefixDigest` 只覆盖 `[systemEnd, coveredUntilExclusive)` 的稳定消息序列，明确排除动态刷新且不会进入摘要输入的 `sourceHistory[0]` system prompt。system 的实际 token 每轮仍重新估算；summary template/provider/model/reasoning replay mode 则作为 checkpoint 独立版本字段参与有效性判断。
+`coveredPrefixDigest` 只覆盖 `[systemEnd, coveredUntilExclusive)` 的稳定消息序列，明确排除动态刷新且不会进入摘要输入的 `sourceHistory[0]` system prompt。checkpoint 还保存创建时 source size / 全 source 基线 digest，projection state 保存最近一次成功观察到的 source size / digest，用于证明两次投影间只发生尾部 append；`retainRecentRounds` 也作为策略字段参与校验。system 的实际 token 每轮仍重新估算；summary template/provider/model/reasoning replay mode 则作为 checkpoint 独立版本字段参与有效性判断。
 
 ### 3.2 模型视图算法
 
 ```text
-1. 计算 rawView = sourceHistory 的完整请求预算
+1. Phase 90.2 计算 rawView 的消息级估算（完整请求预算由 Phase 90.3 补齐）
 2. 若 rawView < softTrigger：直接返回 sourceHistory 的不可变副本；已有 checkpoint 可保留为缓存但本轮不强制使用
 3. 若 rawView 需要投影且已有 checkpoint：先构造 [system] + [summary] + [ack] + [未覆盖 tail]
 4. 若该 view < softTrigger：复用 checkpoint，不再次调用摘要 LLM
@@ -374,11 +396,11 @@ Phase 90 的硬约束是：`ConversationHistoryCompactor` 不得再调用 `sourc
    b. 保留最近 3 个 user 起算的完整尾部
    c. 只有 split > coveredUntilExclusive 时，才用“旧 summary + [coveredUntilExclusive, split) 新覆盖段”增量生成新 summary
    d. 更新 coveredUntilExclusive 与 prefix digest
-6. 对新 view 再做预算校验；必要时继续推进 split，直到低于 soft trigger，或已达到“至少保留最近 3 个 user”的边界
-7. 最终 view 低于 hard ceiling 后才调用业务 LLM；最小尾部本身仍超限时受控失败
+6. Phase 90.2 对新 view 记录消息级前后估算；split 已是“保留最近 3 个 user”的最远合法边界，不重复摘要同一前缀
+7. Phase 90.3 再对完整 request 做 hard-ceiling 校验；当前最小尾部仍超限时可能由 provider 返回 context-length error
 ```
 
-如果找不到 `split > coveredUntilExclusive`（例如尾部 user 轮次不足或最小保留尾部已经占满窗口），不得重复摘要同一前缀或伪造 checkpoint：当前 candidate 安全则复用，否则按 hard failure 处理。
+如果找不到 `split > coveredUntilExclusive`（例如尾部 user 轮次不足或最小保留尾部已经占满窗口），不得重复摘要同一前缀或伪造 checkpoint：Phase 90.2 复用包含完整 tail 的旧 candidate；Phase 90.3 再决定它是否超过 hard ceiling。
 
 模型视图继续沿用 Phase 24 的结构化 Markdown 摘要，并保持当前兼容形态：
 
@@ -399,7 +421,7 @@ summary user message 末尾再由程序确定性追加一个“可恢复工具�
 
 - `/clear`；
 - 已覆盖范围内消息被历史图片省略等既有逻辑改写；ReAct/SubAgent 的 image prune 必须发生在 checkpoint 校验之前；
-- system 之外的消息被插入、删除或重排；
+- system 之外的消息被插入、删除、重排或覆盖；append baseline / 最近观察 digest 用来区分合法尾部增长与 retained tail 改写；
 - model/provider 切换导致 summary 策略版本变化；
 - 结构化摘要模板版本变化。
 
@@ -407,20 +429,20 @@ summary user message 末尾再由程序确定性追加一个“可恢复工具�
 
 session manifest handle 在同一 artifact session 内稳定，新增 artifact 只更新 manifest 内容与动态索引块，不使 summary checkpoint 失效；每次构造 model view 都重新读取 manifest 的 count/latest metadata。显式 `/clear` 会轮换 session handle，并与 source/projection state 一起重置。
 
-projection state 采用原子提交：只有完整 model view 构建、artifact index 追加和 hard ceiling 校验都成功后，调用方才替换 `projectionState`。失败保留上一个 checkpoint，但不得用不含当前 source tail 的旧 view 静默调用业务 LLM。
+projection state 采用原子提交：Phase 90.2 只有完整 model view 构建和 artifact index 追加成功后，调用方才替换 `projectionState`；Phase 90.3 再把 hard ceiling 校验加入同一提交点。失败保留上一个 checkpoint，但不得用不含当前 source tail 的旧 view 静默调用业务 LLM。
 
 ### 3.4 摘要失败策略
 
-当前实现摘要失败时直接跳过压缩，随后仍可能把超窗请求发给 provider。Phase 90 改为两级判定：
+Phase 90.2 已实现非破坏性失败回退；完整 hard-ceiling 分级仍留给 Phase 90.3：
 
-1. 摘要失败，但包含**当前全部 source tail** 的 raw/candidate view 仍低于 hard ceiling：记录 warning，临时使用该未压缩 view；
-2. 没有任何包含当前 tail 的 candidate view 能低于 hard ceiling：不发送请求，返回明确的 `CONTEXT_VIEW_BUILD_FAILED`，提示用户 `/clear` 后缩小并重试。旧 checkpoint 只用于后续重建和诊断，不能丢掉新消息后继续请求。
+1. Phase 90.2：有有效旧 checkpoint 时使用“旧 summary + 从旧 covered boundary 开始的完整当前 tail”；没有有效 checkpoint 时使用当前 source 的不可变快照；两者都不提交失败的摘要。
+2. Phase 90.3：若任何包含当前 tail 的 candidate 都超过 hard ceiling，则不发送请求并返回明确 `CONTEXT_VIEW_BUILD_FAILED`。旧 checkpoint 不能用于丢掉新消息后继续请求。
 
 失败绝不能修改 `sourceHistory` 或覆盖最后一个有效 checkpoint。
 
-摘要调用本身也走独立的 `RequestContextEstimator`：tools schema=0，summary output reserve 默认 `min(4,096, window × 25%)`，输入不得超过该摘要请求自己的 hard ceiling。第一版继续保留输入上限，不复制 `ContextCompressor` 的完整 Map-Reduce；若安全预算无法容纳摘要请求则按失败处理。摘要输出同时限制为 estimated 4,096 tokens / 16,000 chars（先到者生效），超限或缺少必要结构标题视为失败，不能让一个异常长 summary 再次撑爆 model view。
+Phase 90.2 先固定摘要源输入最多 60,000 Unicode code points，并把输出限制为 estimated 4,096 tokens / 16,000 chars（先到者生效）；空白、超限或缺少必要结构标题均视为失败。摘要不序列化 `reasoningContent`，避免隐藏 reasoning 暴露到普通 user summary。摘要请求自己的 response reserve / hard ceiling 由 Phase 90.3 的独立 `RequestContextEstimator` 补齐。
 
-跨路径失败返回保持可区分且不污染 source：ReAct 返回 context error 且不追加 assistant；SubAgent 返回 `AgentMessage.error`；Plan task 返回失败的 `TaskRunResult` 并由外层停止/标记该 task；Runtime API 将其映射为 `turn.failed`/对应 error code，而不是伪装为正常 assistant 文本。
+Phase 90.2 的摘要失败不会污染 source/state，但仍可能把 raw/旧 checkpoint candidate 交给 provider；跨路径 `CONTEXT_VIEW_BUILD_FAILED` 与 Runtime error 映射属于 Phase 90.3，尚未交付。
 
 ### 3.5 三条路径接入
 
@@ -620,15 +642,15 @@ List<LlmClient.Tool> tools = shouldUseTools()
         ? toolRegistry.getToolDefinitions()
         : List.of();
 
-ProjectionResult projection = historyCompactor.project(
+HistoryProjectionResult projection = historyCompactor.project(
         sourceHistory,
         projectionState,
-        tools,
-        RequestContextEstimator.forClient(llmClient));
+        triggerTokens,
+        toolRegistry.getToolResultArtifactIndex());
 
 projectionState = projection.nextState();
 LlmClient.ChatResponse response = llmClient.chat(
-        projection.modelView(),
+        projection.modelMessages(),
         tools,
         streamRenderer);
 ```
@@ -669,7 +691,7 @@ LLM 看到 preview + handle
 
 验收结果（2026-08-12）：已用 100k+ Unicode/MCP/legacy 工具结果验证固定大小 envelope、UTF-8 metadata、session manifest、code-point 分页重组与 SHA-256；同时覆盖 freshness 预检、read-only Explore 共享 scope、nested StepSearch 不重复投影、图片 parts 保留、`/clear` 轮换 session、项目切换、活动 batch/clear 串行化、损坏 metadata/digest、symlink 逃逸、写盘/配额失败降级和 Plan 有界 fallback。Phase 90.1 定向联合回归与 Maven package 通过；本机无创建 symlink 的权限，2 个 symlink 攻击回归按前置条件跳过。`-Pquick` 执行 835 项，其中 15 项仍因既有 Windows 路径/CRLF、RAG 临时目录与受限 DNS 环境失败，不属于本期改动路径。
 
-### Phase 90.2：source history / model view 分离
+### Phase 90.2：source history / model view 分离 ✅ 已交付
 
 范围：
 
@@ -681,12 +703,14 @@ LLM 看到 preview + handle
 
 验收：触发一次和多次压缩后，source history 内容不变；model view 变短；最近 tool call/result 配对完整；摘要失败不污染 source 或有效 checkpoint。
 
+验收结果（2026-08-12）：新增不可变 `HistoryProjectionResult` / `HistoryProjectionState` / `SummaryCheckpoint`；prefix digest 覆盖 role/content/contentParts/tool call/tool_call_id/reasoning，排除动态 system[0]；source append baseline 会拒绝 retained tail 的插入、删除、重排或覆盖。ReAct、Plan task、Worker SubAgent 的业务 `chat()` 均改传 model view。连续增长只总结新覆盖前缀，provider/model/replay/summary/retain policy/manifest scope 变化会使 checkpoint 失效；artifact count/latest 通过有界动态索引刷新。摘要 IOException、空白、超长、缺标题及 reasoning 容器均不提交状态；有效旧 checkpoint 回退仍包含完整当前 tail。定向测试覆盖 source 逐字段不变、嵌套列表不可变、tool pair、DeepSeek/Kimi replay 能力、三路径请求捕获、`/clear`/项目/新任务生命周期与 Plan task 图片生命周期。Maven 定向联合回归与 package 通过；`-Pquick` 当前执行 852 项，仍为既有 Windows URI/路径/CRLF、RAG 临时目录和受限 DNS 导致的 10 failures + 5 errors，4 项按环境前置条件跳过，没有 Phase 90.2 新增失败。
+
 ### Phase 90.3：统一请求预算与可见化
 
 范围：
 
 - `RequestContextEstimator` / `RequestContextBudget`；
-- provider reasoning replay 能力公开并与请求构造共用；
+- 使用 Phase 90.2 已公开的 provider reasoning replay 能力完成请求 token accounting；
 - 实际 tools wire schema 估算；
 - response reserve、safety margin 与 soft/hard 两级判定；
 - `/context`、状态栏 `ctx`、request log 使用同一 accounting；
@@ -710,12 +734,15 @@ LLM 看到 preview + handle
 |------|------|
 | `context/RequestContextEstimator.java` | 估算 messages/reasoning/tool calls/schema/reserve |
 | `context/RequestContextBudget.java` | 分项、soft trigger、hard ceiling、诊断文本 |
-| `context/HistoryProjectionState.java` | summary checkpoint 与最近 view |
+| `memory/HistoryProjectionState.java` | summary checkpoint 状态 |
+| `memory/HistoryProjectionResult.java` | 不可变 model view、covered prefix、消息级 token 前后估算 |
+| `memory/SummaryCheckpoint.java` | covered digest 与 policy/provider/replay/manifest 身份 |
 | `tool/ToolResultArtifactStore.java` | UTF-8 工件、句柄、分页、TTL、配额 |
 | `tool/ToolResultArtifactRef.java` | artifact metadata 值对象 |
 | `tool/ToolResultMetadata.java` | UI/partial/producer truncation 的有界结构化状态 |
 | `tool/ToolResultProjection.java` | context envelope、display preview 与结构化状态 |
 | `tool/ToolResultAccumulator.java` | Plan 多轮工具结果的有界 fallback/index |
+| `tool/ToolResultArtifactIndex.java` | manifest handle/count 与最近工件的有界动态快照 |
 | 对应测试类 | 边界、失败、并发、路径安全、三路径契约 |
 
 ### 7.2 预计修改
@@ -723,7 +750,7 @@ LLM 看到 preview + handle
 | 文件/模块 | 修改内容 |
 |-----------|----------|
 | `ToolRegistry.java` / `ToolOutput.java` | 统一 projection、注册 `read_tool_result`、只读 view 共享 store、保留 image/timedOut 语义 |
-| `Agent.java` | freshness preflight 对齐；维护 projection state；chat 使用 model view；`/context` 共用 estimator |
+| `Agent.java` | freshness preflight 对齐；维护 projection state；chat 使用 model view；`ctx` 使用无摘要副作用的现有 checkpoint candidate，完整 request estimator 留待 90.3 |
 | `PlanExecuteAgent.java` | task 局部 projection state；`allResults` 只累计 envelope/小结果 |
 | `SubAgent.java` | 维护 projection state；Worker 工具集可读取 handle |
 | `ConversationHistoryCompactor.java` | 从原地修改改为返回不可变 view；checkpoint 增量摘要 |
@@ -755,17 +782,17 @@ LLM 看到 preview + handle
 - 并行 4 个结果不覆盖、不乱 handle；
 - `read_tool_result` 不发生递归 spill。
 
-`ConversationHistoryCompactorTest`：
+`ConversationHistoryCompactorTest`（Phase 90.2 已覆盖）：
 
 - 低于 soft trigger 时 model view 等于 source 的不可变副本；
 - 触发压缩后 source 逐字段不变；
 - summary + 最近 3 个 user 尾部结构正确；
 - tool call/result 在切割边界成对保留；
 - 第二次增长复用并推进 checkpoint，不重复总结已覆盖原文；
-- prefix digest 失效时重建；
+- prefix digest、append baseline、retain 策略失效时重建；model view 的消息嵌套列表不可修改；
 - manifest 内容增长只刷新动态 artifact index，不重复摘要；压缩后仍能从 manifest 发现旧 handle/digest；
-- 空摘要、IOException、hard ceiling 的三种降级路径；
-- summary request 自身受预算保护，summary 输出超限/缺标题时不提交 checkpoint；
+- 空摘要、IOException、超长/缺标题输出的降级路径；hard ceiling 留待 Phase 90.3；
+- summary 输入/输出有界，显式 reasoning 容器会被剥离，异常结果不提交 checkpoint；
 - summary prompt 继续包含 Phase 24 的九个结构化标题。
 
 `RequestContextEstimatorTest`：
@@ -797,7 +824,7 @@ LLM 看到 preview + handle
 
 ```bash
 mvn test -Dtest=ToolResultArtifactStoreTest,ConversationHistoryCompactorTest,RequestContextEstimatorTest,ToolRegistryTest -DskipTests=false
-mvn test -Dtest=AgentClearHistoryTest,AgentHeadlessResultTest,AgentWebSearchPreflightTest,AgentExplorePrecheckTest,PlanExecuteAgentTest,SubAgentTest,AgentOrchestratorTest -DskipTests=false
+mvn test -Dtest=AgentClearHistoryTest,AgentHeadlessResultTest,AgentWebSearchPreflightTest,AgentExplorePrecheckTest,HistoryProjectionAgentIntegrationTest,PlanExecuteAgentTest,SubAgentTest,AgentOrchestratorTest -DskipTests=false
 mvn test -Pquick
 ```
 
@@ -828,7 +855,7 @@ mvn test -Pquick
 
 ## 10. 完成定义
 
-Phase 90 只有同时满足以下条件才算交付：
+Phase 90 全阶段只有同时满足以下条件才算交付；当前 Phase 90.1–90.2 已满足其中 1–3、6 以及相应定向测试/文档，4–5 与全阶段验证仍由 Phase 90.3 完成：
 
 1. 配额内的大工具结果不会完整进入任何 Agent 的模型历史，且句柄分页读取能还原 ToolRegistry 边界文本的 Unicode 规范化值；
 2. `ConversationHistoryCompactor` 的测试和代码均不存在对 source history 的 `clear + addAll` 替换；

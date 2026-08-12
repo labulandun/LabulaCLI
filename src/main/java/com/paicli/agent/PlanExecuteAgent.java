@@ -8,6 +8,8 @@ import com.paicli.llm.LlmTimeoutException;
 import com.paicli.llm.LlmTraceLogger;
 import com.paicli.lsp.LspDiagnosticReport;
 import com.paicli.memory.ConversationHistoryCompactor;
+import com.paicli.memory.HistoryProjectionResult;
+import com.paicli.memory.HistoryProjectionState;
 import com.paicli.memory.MemoryManager;
 import com.paicli.plan.*;
 import com.paicli.prompt.PromptAssembler;
@@ -189,16 +191,35 @@ public class PlanExecuteAgent {
         this.skillContextBuffer = skillContextBuffer;
     }
 
-    private void maybeCompactHistory(List<LlmClient.Message> messages, PrintStream out) {
-        if (historyCompactor == null) return;
+    private HistoryProjectionResult projectHistory(List<LlmClient.Message> messages,
+                                                   HistoryProjectionState state,
+                                                   PrintStream out) {
         int trigger = memoryManager.getContextProfile().compressionTriggerTokens();
         try {
-            boolean compacted = historyCompactor.compactIfNeeded(messages, trigger);
-            if (compacted && out != null) {
+            HistoryProjectionResult projection = historyCompactor.project(
+                    messages,
+                    state,
+                    trigger,
+                    toolRegistry.getToolResultArtifactIndex());
+            if (projection.checkpointAdvanced() && out != null) {
                 out.println("📦 上下文接近窗口上限，已把早期对话压缩为摘要后继续。");
             }
+            return projection;
         } catch (Exception e) {
-            log.warn("conversationHistory compaction failed", e);
+            log.warn("plan task history projection failed; using immutable source snapshot", e);
+            List<LlmClient.Message> sourceSnapshot = List.copyOf(messages);
+            int tokens = com.paicli.memory.TokenBudget.estimateMessagesTokens(sourceSnapshot);
+            return new HistoryProjectionResult(
+                    sourceSnapshot,
+                    state,
+                    false,
+                    false,
+                    0,
+                    0,
+                    "",
+                    tokens,
+                    tokens,
+                    true);
         }
     }
 
@@ -561,6 +582,8 @@ public class PlanExecuteAgent {
                         taskInput,
                         Path.of(toolRegistry.getProjectPath()))
         ));
+        // Task-local by design: images and projection checkpoints are discarded with this task.
+        HistoryProjectionState projectionState = HistoryProjectionState.empty();
 
         ToolResultAccumulator allResults = new ToolResultAccumulator(
                 toolRegistry.getToolResultManifestHandle());
@@ -579,12 +602,13 @@ public class PlanExecuteAgent {
             }
             iteration++;
 
-            // 调 LLM 前评估 messages 是否接近 window 上限；超阈值压缩早期消息为摘要。
+            // Keep task source messages intact and derive only the immutable request view.
             injectPendingLspDiagnostics(messages, out);
-            maybeCompactHistory(messages, out);
+            HistoryProjectionResult projection = projectHistory(messages, projectionState, out);
+            projectionState = projection.nextState();
 
             LlmClient.ChatResponse response = llmClient.chat(
-                    messages,
+                    projection.modelMessages(),
                     toolRegistry.getToolDefinitions(),
                     streamRenderer
             );

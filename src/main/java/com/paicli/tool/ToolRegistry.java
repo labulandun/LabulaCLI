@@ -197,6 +197,16 @@ public class ToolRegistry {
         return toolResultArtifactStore.sessionBytes();
     }
 
+    /** Bounded metadata for deterministic artifact recovery hints in projected model history. */
+    public ToolResultArtifactIndex getToolResultArtifactIndex() {
+        return toolResultArtifactStore.artifactIndexSnapshot(5);
+    }
+
+    /** Explicitly named alias for diagnostics and tests. */
+    public ToolResultArtifactIndex getToolResultArtifactIndexSnapshot() {
+        return getToolResultArtifactIndex();
+    }
+
     /** Rotates the owning CLI/runtime artifact scope. Shared Explore views never clear it. */
     public void clearToolResultArtifacts() {
         if (artifactStoreOwner) {

@@ -18,6 +18,7 @@ import com.paicli.image.ImageReferenceParser;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class AbstractOpenAiCompatibleClientImageInputTest {
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -118,6 +119,7 @@ class AbstractOpenAiCompatibleClientImageInputTest {
 
                             """));
             KimiClient client = new KimiClient("test-key", "kimi-k2.6", server.url("/v1").toString());
+            assertTrue(client.replaysReasoningContent());
 
             client.chat(List.of(LlmClient.Message.assistant(
                     "hidden reasoning",
@@ -150,6 +152,7 @@ class AbstractOpenAiCompatibleClientImageInputTest {
                             """));
             DeepSeekClient client = new DeepSeekClient("test-key", "deepseek-v4-pro",
                     server.url("/chat/completions").toString());
+            assertTrue(client.replaysReasoningContent());
 
             client.chat(List.of(LlmClient.Message.assistant(
                     "hidden reasoning",

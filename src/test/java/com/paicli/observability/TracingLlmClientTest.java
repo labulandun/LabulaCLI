@@ -76,11 +76,24 @@ class TracingLlmClientTest {
         }
     }
 
+    @Test
+    void forwardsReasoningReplayCapability() {
+        LlmClient delegate = new FixedLlmClient() {
+            @Override
+            public boolean replaysReasoningContent() {
+                return true;
+            }
+        };
+        LlmClient traced = PaiCliTracing.noop().traceLlmClient(delegate);
+
+        assertTrue(traced.replaysReasoningContent());
+    }
+
     private static String stringAttribute(SpanData span, String key) {
         return span.getAttributes().get(AttributeKey.stringKey(key));
     }
 
-    private static final class FixedLlmClient implements LlmClient {
+    private static class FixedLlmClient implements LlmClient {
         @Override
         public ChatResponse chat(List<Message> messages, List<Tool> tools) {
             return response();

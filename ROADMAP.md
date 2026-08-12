@@ -603,14 +603,17 @@
 **估算**：5–6 天
 
 ---
-## 横向能力：长上下文改进 ✅ Phase 90.1 / ⏳ 90.2–90.3
+## 横向能力：长上下文改进 ✅ Phase 90.1–90.2 / ⏳ 90.3
 
 - Phase 90.1 已交付：大文本工具结果在 `ToolRegistry` 顶层模型边界自动写为 UTF-8 工件；ReAct、Plan、Worker、freshness 预检与 nested Explore 的 history 只接收有界 preview + digest + manifest + opaque handle
 - `read_tool_result` 支持 session/project scope 校验、Unicode code-point 分页、SHA-256 完整性检查；读工具 spill-exempt，避免递归生成工件
 - Plan 工具 fallback 改为 24,000 code points 有界 accumulator；UI、partial 判断与 tracing 使用释放原文前生成的 bounded metadata/display preview
 - 默认 4,096 estimated tokens spill、32 MiB/工件、256 MiB/session、7 天留存；`/clear` 轮换 artifact session
+- Phase 90.2 已交付：`ConversationHistoryCompactor.project(...)` 从完整 source history 生成不可变 model view；ReAct、Plan task、Worker SubAgent 的业务 LLM 只接收该 view，摘要/ack 不反写 source
+- checkpoint 记录 covered boundary + 全字段 prefix digest，并绑定摘要 policy/provider/model/reasoning replay/manifest scope；连续增长只总结新增前缀，artifact count/latest index 动态刷新但不使摘要失效
+- 摘要失败、空白、缺结构标题或超过 16,000 chars / 约 4,096 tokens 不污染 source/state；`/clear`、项目/模型切换及新 SubAgent/Plan task 重置各自 projection state
 
-**后续**：Phase 90.2 的非破坏性 conversationHistory 投影视图、Phase 90.3 的完整请求预算（tool schema/reasoning/output reserve）尚未交付，不能把 90.1 误报为三个问题都已解决。
+**后续**：Phase 90.3 的完整请求预算（tools wire schema、replayed reasoning、framing、response reserve、安全余量和 hard ceiling）尚未交付；Phase 90.2 仍使用消息级启发式 trigger，不能误报为完整请求预算已解决。
 
 详细设计：`docs/phase-90-recoverable-context-compaction.md`
 
@@ -694,4 +697,4 @@ Git       Prompt    异步后台    图片
 
 ---
 
-*已完成第 16 期 TUI 产品化（含 16.1 形态修正：默认切换为 inline 流式 TUI，Lanterna 全屏 TUI 通过 `PAICLI_RENDERER=lanterna` 保留）、第 17 期 LSP 诊断注入 MVP、第 18 期 Git Side-History 快照与回滚 MVP、第 19 期 Prompt 分层架构 MVP、第 20 期后台任务 + Runtime API MVP、第 21 期图片复制粘贴输入 MVP、Phase 90.1 可恢复工具结果工件，以及 OpenTelemetry / Langfuse ReAct 可观测性 MVP。*
+*已完成第 16 期 TUI 产品化（含 16.1 形态修正：默认切换为 inline 流式 TUI，Lanterna 全屏 TUI 通过 `PAICLI_RENDERER=lanterna` 保留）、第 17 期 LSP 诊断注入 MVP、第 18 期 Git Side-History 快照与回滚 MVP、第 19 期 Prompt 分层架构 MVP、第 20 期后台任务 + Runtime API MVP、第 21 期图片复制粘贴输入 MVP、Phase 90.1 可恢复工具结果工件、Phase 90.2 非破坏性历史投影，以及 OpenTelemetry / Langfuse ReAct 可观测性 MVP。*

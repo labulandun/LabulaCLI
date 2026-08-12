@@ -48,6 +48,8 @@ class AgentClearHistoryTest {
 
             List<LlmClient.Message> history = agent.getConversationHistory();
             assertEquals(1, history.size());
+            assertTrue(agent.getLastModelConversationView().isEmpty());
+            assertFalse(agent.getHistoryProjectionState().hasCheckpoint());
             assertFalse(history.get(0).content().contains("CLEAR_MARKER"),
                     "/clear must not preserve the previous query's retrieved memory in system prompt");
             assertFalse(history.get(0).content().contains("## 相关长期记忆"));
@@ -107,10 +109,13 @@ class AgentClearHistoryTest {
         agent.run("remember this turn");
         String oldManifest = registry.getToolResultManifestHandle();
         assertTrue(agent.getConversationHistory().size() > 1);
+        assertFalse(agent.getLastModelConversationView().isEmpty());
 
         assertTrue(agent.switchProjectPath(secondProject.toString()));
 
         assertEquals(1, agent.getConversationHistory().size());
+        assertTrue(agent.getLastModelConversationView().isEmpty());
+        assertFalse(agent.getHistoryProjectionState().hasCheckpoint());
         assertFalse(oldManifest.equals(registry.getToolResultManifestHandle()));
     }
 

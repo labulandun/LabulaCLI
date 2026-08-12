@@ -46,8 +46,18 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
 
     protected abstract String getApiKey();
 
+    /**
+     * Compatibility hook for provider implementations created before the capability was exposed
+     * on {@link LlmClient}. New callers should use {@link #replaysReasoningContent()}.
+     */
+    @Deprecated
     protected boolean shouldSendReasoningContentInRequestHistory() {
         return false;
+    }
+
+    @Override
+    public boolean replaysReasoningContent() {
+        return shouldSendReasoningContentInRequestHistory();
     }
 
     @Override
@@ -362,7 +372,7 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
             ObjectNode msgNode = messagesArray.addObject();
             msgNode.put("role", msg.role());
             appendMessageContent(msgNode, msg);
-            if (shouldSendReasoningContentInRequestHistory()
+            if (replaysReasoningContent()
                     && "assistant".equals(msg.role())
                     && msg.reasoningContent() != null
                     && !msg.reasoningContent().isBlank()) {
