@@ -12,6 +12,8 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Optional;
 
+import com.paicli.context.ContextViewBuildException;
+
 import static org.junit.jupiter.api.Assertions.*;
 
 class RuntimeApiServerTest {
@@ -67,6 +69,37 @@ class RuntimeApiServerTest {
         }
     }
 
+    @Test
+    void reportsContextViewBuildFailureAsFailedTurn(@TempDir Path tempDir) throws Exception {
+        try (RuntimeThreadStore store = new RuntimeThreadStore(tempDir.resolve("runtime-failed.db"));
+             RuntimeApiServer server = new RuntimeApiServer(
+                     store,
+                     prompt -> {
+                         throw new IllegalStateException(ContextViewBuildException.CODE
+                                 + ": estimated input exceeds hard input ceiling");
+                     },
+                     0,
+                     "secret")) {
+            server.start();
+            HttpClient client = HttpClient.newHttpClient();
+            String base = "http://127.0.0.1:" + server.port();
+            HttpResponse<String> created = client.send(
+                    request(base + "/v1/threads", "POST", "").build(),
+                    HttpResponse.BodyHandlers.ofString());
+            String threadId = extract(created.body(), "thread_");
+
+            client.send(request(base + "/v1/threads/" + threadId + "/turns", "POST",
+                            "{\"input\":\"oversized\"}").build(),
+                    HttpResponse.BodyHandlers.ofString());
+            String events = waitForTerminalEvents(client, base, threadId);
+
+            assertTrue(events.contains("event: turn.failed"));
+            assertTrue(events.contains("\"status\":\"failed\""));
+            assertTrue(events.contains(ContextViewBuildException.CODE));
+            assertFalse(events.contains("event: turn.completed"));
+        }
+    }
+
     private static HttpRequest.Builder request(String url, String method, String body) {
         HttpRequest.BodyPublisher publisher = body == null || body.isEmpty()
                 ? HttpRequest.BodyPublishers.noBody()
@@ -79,12 +112,16 @@ class RuntimeApiServerTest {
     }
 
     private static String waitForEvents(HttpClient client, String base, String threadId) throws Exception {
+        return waitForTerminalEvents(client, base, threadId);
+    }
+
+    private static String waitForTerminalEvents(HttpClient client, String base, String threadId) throws Exception {
         long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
         while (System.nanoTime() < deadline) {
             HttpResponse<String> response = client.send(request(base + "/v1/threads/" + threadId + "/events", "GET", "")
                             .build(),
                     HttpResponse.BodyHandlers.ofString());
-            if (response.body().contains("turn.completed")) {
+            if (response.body().contains("turn.completed") || response.body().contains("turn.failed")) {
                 return response.body();
             }
             Thread.sleep(30);

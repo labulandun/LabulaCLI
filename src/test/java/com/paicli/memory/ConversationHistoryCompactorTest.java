@@ -1,5 +1,8 @@
 package com.paicli.memory;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.paicli.context.ContextProfile;
+import com.paicli.context.RequestContextEstimator;
 import com.paicli.llm.LlmClient;
 import com.paicli.tool.ToolResultArtifactIndex;
 import com.paicli.tool.ToolResultArtifactRef;
@@ -13,6 +16,8 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.*;
 
 class ConversationHistoryCompactorTest {
+
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     @Test
     void belowTriggerReturnsImmutableSourceSnapshot() {
@@ -30,6 +35,68 @@ class ConversationHistoryCompactorTest {
         assertThrows(UnsupportedOperationException.class,
                 () -> result.modelMessages().add(LlmClient.Message.user("mutate")));
         assertEquals(2, source.size());
+    }
+
+    @Test
+    void completeRequestAccountingLetsDynamicToolSchemaTriggerProjection() throws Exception {
+        MutableClient client = new MutableClient("test", "test", false);
+        StubCompactor compactor = new StubCompactor(
+                client, "schema-trigger", 3, ConversationHistoryCompactor.DEFAULT_SUMMARY_POLICY_VERSION);
+        List<LlmClient.Message> source = new ArrayList<>(List.of(
+                LlmClient.Message.system("system"),
+                LlmClient.Message.user("round-1"),
+                LlmClient.Message.assistant("answer-1"),
+                LlmClient.Message.user("round-2"),
+                LlmClient.Message.assistant("answer-2"),
+                LlmClient.Message.user("round-3"),
+                LlmClient.Message.assistant("answer-3"),
+                LlmClient.Message.user("round-4")
+        ));
+        LlmClient.Tool largeTool = new LlmClient.Tool(
+                "dynamic_mcp_tool",
+                "schema ".repeat(12_000),
+                MAPPER.readTree("{\"type\":\"object\",\"properties\":{}}"));
+        RequestContextEstimator estimator = new RequestContextEstimator(
+                client, ContextProfile.custom(32_000, 14_000));
+
+        HistoryProjectionResult result = compactor.project(
+                source,
+                HistoryProjectionState.empty(),
+                estimator,
+                List.of(largeTool),
+                ToolResultArtifactIndex.empty());
+
+        assertTrue(result.compacted());
+        assertTrue(result.checkpointAdvanced());
+        assertEquals(1, compactor.initialCalls);
+        assertEquals(8, source.size(), "projection must not rewrite source history");
+    }
+
+    @Test
+    void summaryRequestUsesTheProvidedRequestProfileBeforeCallingModelHook() {
+        MutableClient client = new MutableClient("test", "test", false);
+        StubCompactor compactor = new StubCompactor(
+                client, "summary-budget", 1, ConversationHistoryCompactor.DEFAULT_SUMMARY_POLICY_VERSION);
+        List<LlmClient.Message> source = List.of(
+                LlmClient.Message.system("system"),
+                LlmClient.Message.user("old-large " + "x".repeat(30_000)),
+                LlmClient.Message.assistant("old answer"),
+                LlmClient.Message.user("recent tail"));
+        RequestContextEstimator estimator = new RequestContextEstimator(
+                client, ContextProfile.custom(8_000, 4_000));
+
+        HistoryProjectionResult result = compactor.project(
+                source,
+                HistoryProjectionState.empty(),
+                estimator,
+                null,
+                ToolResultArtifactIndex.empty());
+
+        assertTrue(result.summaryFailed());
+        assertEquals(0, compactor.initialCalls,
+                "the provided request profile must block the summary before its model hook");
+        assertFalse(result.nextState().hasCheckpoint());
+        assertEquals(source, result.modelMessages());
     }
 
     @Test

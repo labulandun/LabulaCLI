@@ -5,6 +5,9 @@ import com.paicli.llm.LlmCancelledException;
 import com.paicli.llm.LlmTimeoutException;
 import com.paicli.llm.LlmTraceLogger;
 import com.paicli.context.ContextProfile;
+import com.paicli.context.ContextViewBuildException;
+import com.paicli.context.RequestContextBudget;
+import com.paicli.context.RequestContextEstimator;
 import com.paicli.context.TokenUsageFormatter;
 import com.paicli.lsp.LspDiagnosticReport;
 import com.paicli.memory.ConversationHistoryCompactor;
@@ -62,6 +65,10 @@ public class Agent {
     private static final long EXPLORE_ACQUIRE_TIMEOUT_SECONDS = 30;
     // 子 Agent 探索过程默认折叠 / 静默：中间多轮 grep/read 不进主 transcript,只回传最终报告。
     private static final PrintStream EXPLORER_SILENT_OUT = new PrintStream(OutputStream.nullOutputStream());
+
+    private record PreparedRequest(HistoryProjectionResult projection,
+                                   RequestContextBudget budget) {
+    }
 
     // 23.5 确定性预检：窗口内连续检索工具调用数超此阈值时,注入建议改用 explore_codebase 的提示。
     static final int EXPLORE_PRECHECK_THRESHOLD = 6;
@@ -219,7 +226,9 @@ public class Agent {
                 }
                 return result;
             } catch (RuntimeException e) {
-                traceRun.error(PaiCliTracing.RunOutcome.UNEXPECTED_ERROR, e);
+                if (!(e.getCause() instanceof ContextViewBuildException)) {
+                    traceRun.error(PaiCliTracing.RunOutcome.UNEXPECTED_ERROR, e);
+                }
                 throw e;
             }
         }
@@ -271,7 +280,6 @@ public class Agent {
             }
             // 先向 source history 注入本轮诊断，再基于 source 构建不可变 model view。
             injectPendingLspDiagnostics();
-            HistoryProjectionResult projection = projectHistory();
             AgentBudget.ExitReason exitReason = budget.check();
             if (exitReason != AgentBudget.ExitReason.WITHIN_BUDGET) {
                 String description = budget.describeExit(exitReason);
@@ -287,9 +295,11 @@ public class Agent {
 
             try {
                 List<LlmClient.Tool> toolDefinitions = toolRegistry.getToolDefinitions();
+                PreparedRequest prepared = prepareHistoryRequest(toolDefinitions);
+                HistoryProjectionResult projection = prepared.projection();
                 lastModelConversationView = projection.modelMessages();
-                logRequestContext("react iteration=" + iteration, toolDefinitions,
-                        lastModelConversationView);
+                logRequestContext("react iteration=" + iteration,
+                        lastModelConversationView, prepared.budget());
                 streamRenderer.beginThinking();
                 // 调用 LLM
                 LlmClient.ChatResponse response = llmClient.chat(
@@ -370,6 +380,16 @@ public class Agent {
                 traceRun.output(response.content());
                 return finalResponse;
 
+            } catch (ContextViewBuildException e) {
+                log.warn("LLM request blocked by context hard ceiling: {}", e.budget().diagnosticText());
+                streamRenderer.finish();
+                pushStatus(budget, startNanos, "idle");
+                traceRun.outcome(PaiCliTracing.RunOutcome.BUDGET_EXHAUSTED, e.getMessage());
+                if (returnStreamedContent) {
+                    // Headless Runtime/Durable Task runners map exceptions to failed terminal state.
+                    throw new IllegalStateException(e.getMessage(), e);
+                }
+                return "❌ " + e.getMessage();
             } catch (LlmTimeoutException e) {
                 log.warn("LLM call timed out in ReAct loop: phase={}", e.phase());
                 streamRenderer.finish();
@@ -464,24 +484,31 @@ public class Agent {
                 .build());
     }
 
-    private HistoryProjectionResult projectHistory() {
-        int trigger = memoryManager.getContextProfile().compressionTriggerTokens();
+    private PreparedRequest prepareHistoryRequest(List<LlmClient.Tool> tools)
+            throws ContextViewBuildException {
+        RequestContextEstimator estimator = new RequestContextEstimator(
+                llmClient, memoryManager.getContextProfile());
         try {
             HistoryProjectionResult projection = historyCompactor.project(
                     conversationHistory,
                     historyProjectionState,
-                    trigger,
+                    estimator,
+                    tools,
                     toolRegistry.getToolResultArtifactIndex());
+            RequestContextBudget budget = estimator.validate(projection.modelMessages(), tools);
+            // Projection state is committed only after the complete request passes hard ceiling.
+            historyProjectionState = projection.nextState();
             if (projection.checkpointAdvanced()) {
                 renderer().stream().println("📦 上下文接近窗口上限，已把早期对话压缩为摘要后继续。");
             }
-            historyProjectionState = projection.nextState();
-            return projection;
+            return new PreparedRequest(projection, budget);
+        } catch (ContextViewBuildException e) {
+            throw e;
         } catch (Exception e) {
             log.warn("conversationHistory projection failed; using immutable source snapshot", e);
             List<LlmClient.Message> sourceSnapshot = List.copyOf(conversationHistory);
             int tokens = com.paicli.memory.TokenBudget.estimateMessagesTokens(sourceSnapshot);
-            return new HistoryProjectionResult(
+            HistoryProjectionResult fallback = new HistoryProjectionResult(
                     sourceSnapshot,
                     historyProjectionState,
                     false,
@@ -492,6 +519,8 @@ public class Agent {
                     tokens,
                     tokens,
                     true);
+            RequestContextBudget budget = estimator.validate(fallback.modelMessages(), tools);
+            return new PreparedRequest(fallback, budget);
         }
     }
 
@@ -730,28 +759,16 @@ public class Agent {
     }
 
     public String getContextStatus() {
-        com.paicli.context.ContextProfile profile = memoryManager.getContextProfile();
+        ContextProfile profile = memoryManager.getContextProfile();
         int window = profile.maxContextWindow();
-        int triggerTokens = profile.compressionTriggerTokens();
-
-        List<LlmClient.Message> contextView = currentEstimatedModelView(profile);
-        // 分类估算下一轮可用 model-view candidate；完整 request accounting 留给 Phase 90.3。
-        int systemTokens = 0, userTokens = 0, assistantTokens = 0, toolTokens = 0;
-        int systemCount = 0, userCount = 0, assistantCount = 0, toolCount = 0;
-        for (LlmClient.Message msg : contextView) {
-            int t = com.paicli.memory.TokenBudget.estimateMessagesTokens(java.util.List.of(msg));
-            switch (msg.role()) {
-                case "system" -> { systemTokens += t; systemCount++; }
-                case "user" -> { userTokens += t; userCount++; }
-                case "assistant" -> { assistantTokens += t; assistantCount++; }
-                case "tool" -> { toolTokens += t; toolCount++; }
-            }
-        }
-        int messagesTokens = userTokens + assistantTokens + toolTokens;
-        int toolsSchemaTokens = estimateToolsSchemaTokens();
-        int total = systemTokens + messagesTokens + toolsSchemaTokens;
+        List<LlmClient.Tool> tools = toolRegistry.getToolDefinitions();
+        RequestContextEstimator estimator = new RequestContextEstimator(llmClient, profile);
+        List<LlmClient.Message> contextView = currentEstimatedModelView(estimator, tools);
+        RequestContextBudget request = estimator.estimate(contextView, tools);
+        RequestContextBudget source = estimator.estimate(conversationHistory, List.of());
+        long total = request.estimatedInputTokens();
         double ratio = window > 0 ? (double) total / window : 0;
-        int triggerRemaining = Math.max(0, triggerTokens - total);
+        long triggerRemaining = Math.max(0L, request.softCompressionTriggerTokens() - total);
 
         StringBuilder sb = new StringBuilder();
         sb.append(String.format("📊 Context Usage   %s   window: %s%n",
@@ -759,18 +776,37 @@ public class Agent {
         sb.append("\n  ").append(progressBar(ratio, 30))
                 .append(String.format("  %d%%  (%s / %s)%n",
                         (int) Math.round(ratio * 100), formatTokens(total), formatTokens(window)));
-        sb.append("\n  当前占用细分:\n");
-        sb.append(formatLine("System prompt",      systemTokens,    window, systemCount));
-        sb.append(formatLine("Tools schema",       toolsSchemaTokens, window, -1));
-        sb.append(formatLine("Conversation",       messagesTokens, window,
-                userCount + assistantCount + toolCount));
+        sb.append("\n  完整请求估算:\n");
+        sb.append(String.format("    Source history:       %8s%n",
+                formatTokens(source.modelViewMessageTokens())));
+        sb.append(String.format("    Model view messages:  %8s  [%d 条]%n",
+                formatTokens(request.modelViewMessageTokens()), request.messageCount()));
+        sb.append(String.format("      images (included):  %8s%n",
+                formatTokens(request.imageTokens())));
+        sb.append(String.format("      replayed reasoning: %8s%n",
+                formatTokens(request.replayedReasoningTokens())));
+        sb.append(String.format("      tool messages:      %8s%n",
+                formatTokens(request.toolMessageContentTokens())));
+        sb.append(String.format("    Tools wire schema:    %8s  [%d 个]%n",
+                formatTokens(request.toolsSchemaWireTokens()), request.toolDefinitionCount()));
+        sb.append(String.format("    Framing / envelope:   %8s%n",
+                formatTokens(request.framingAndEnvelopeTokens())));
         sb.append("    ─────────────────────────────────\n");
-        sb.append(String.format("    合计:              %8s  (%4.1f%%)%n",
+        sb.append(String.format("    Estimated input:      %8s  (%4.1f%%)%n",
                 formatTokens(total), ratio * 100));
-        sb.append(String.format("%n  压缩阈值: %s (%d%%)   距压缩还有: %s%n",
-                formatTokens(triggerTokens),
+        sb.append(String.format("    Response reserve:     %8s%n",
+                formatTokens(request.responseReserveTokens())));
+        sb.append(String.format("    Safety margin:        %8s%n",
+                formatTokens(request.safetyMarginTokens())));
+        sb.append(String.format("    Budget footprint:     %8s / %s%n",
+                formatTokens(request.budgetFootprintTokens()), formatTokens(window)));
+        sb.append(String.format("%n  Soft trigger: %s (%d%% hard ceiling)   距触发还有: %s%n",
+                formatTokens(request.softCompressionTriggerTokens()),
                 (int) (profile.compressionTriggerRatio() * 100),
                 formatTokens(triggerRemaining)));
+        sb.append(String.format("  Hard input ceiling: %s   当前请求: %s%n",
+                formatTokens(request.hardInputCeilingTokens()),
+                request.safeToSend() ? "可发送" : "已超限（将本地拒绝）"));
         sb.append("  MCP resources 自动索引: ")
                 .append(profile.mcpResourceIndexEnabled() ? "开启" : "关闭（window 不足 32k）")
                 .append("\n");
@@ -802,27 +838,23 @@ public class Agent {
         return String.format(Locale.ROOT, "%.1f MiB", bytes / (1024.0 * 1024.0));
     }
 
-    private int estimateToolsSchemaTokens() {
-        try {
-            return com.paicli.memory.MemoryEntry.estimateTokens(
-                    new ObjectMapper().writeValueAsString(toolRegistry.getToolDefinitions()));
-        } catch (Exception e) {
-            return 0;
-        }
-    }
-
     private long estimateCurrentContextTokens() {
-        long messageTokens = com.paicli.memory.TokenBudget.estimateMessagesTokens(
-                currentEstimatedModelView(memoryManager.getContextProfile()));
-        return Math.max(0L, messageTokens + estimateToolsSchemaTokens());
+        ContextProfile profile = memoryManager.getContextProfile();
+        List<LlmClient.Tool> tools = toolRegistry.getToolDefinitions();
+        RequestContextEstimator estimator = new RequestContextEstimator(llmClient, profile);
+        return estimator.estimate(currentEstimatedModelView(estimator, tools), tools)
+                .estimatedInputTokens();
     }
 
-    private List<LlmClient.Message> currentEstimatedModelView(ContextProfile profile) {
+    private List<LlmClient.Message> currentEstimatedModelView(
+            RequestContextEstimator estimator,
+            List<LlmClient.Tool> tools) {
         try {
             return historyCompactor.previewModelMessages(
                     conversationHistory,
                     historyProjectionState,
-                    profile.compressionTriggerTokens(),
+                    estimator,
+                    tools,
                     toolRegistry.getToolResultArtifactIndex());
         } catch (RuntimeException e) {
             log.debug("failed to build model-view context preview; using immutable source snapshot", e);
@@ -830,48 +862,23 @@ public class Agent {
         }
     }
 
-    private void logRequestContext(String scope, List<LlmClient.Tool> tools,
-                                   List<LlmClient.Message> requestMessages) {
+    private void logRequestContext(String scope,
+                                   List<LlmClient.Message> requestMessages,
+                                   RequestContextBudget budget) {
         if (!log.isInfoEnabled()) {
             return;
         }
-        int systemTokens = 0;
-        int userTokens = 0;
-        int assistantTokens = 0;
-        int toolMessageTokens = 0;
         int imageParts = 0;
-        int messages = 0;
         StringBuilder imageDetails = new StringBuilder();
         List<LlmClient.Message> messagesToLog = requestMessages == null ? List.of() : requestMessages;
         for (int messageIndex = 0; messageIndex < messagesToLog.size(); messageIndex++) {
             LlmClient.Message msg = messagesToLog.get(messageIndex);
-            messages++;
-            int tokens = com.paicli.memory.TokenBudget.estimateMessagesTokens(List.of(msg));
             imageParts += msg.imagePartCount();
             appendImageDetails(imageDetails, msg, messageIndex);
-            switch (msg.role()) {
-                case "system" -> systemTokens += tokens;
-                case "user" -> userTokens += tokens;
-                case "assistant" -> assistantTokens += tokens;
-                case "tool" -> toolMessageTokens += tokens;
-                default -> {
-                }
-            }
         }
-        int toolsSchemaTokens = 0;
-        int toolCount = tools == null ? 0 : tools.size();
-        if (tools != null && !tools.isEmpty()) {
-            try {
-                toolsSchemaTokens = com.paicli.memory.MemoryEntry.estimateTokens(
-                        new ObjectMapper().writeValueAsString(tools));
-            } catch (Exception e) {
-                log.debug("Failed to estimate tools schema tokens", e);
-            }
-        }
-        int estimatedTotal = systemTokens + userTokens + assistantTokens + toolMessageTokens + toolsSchemaTokens;
-        log.info("LLM request context [{}]: messages={}, images={}, systemTokens={}, userTokens={}, assistantTokens={}, toolMessageTokens={}, tools={}, toolsSchemaTokens={}, estimatedTotal={}",
-                scope, messages, imageParts, systemTokens, userTokens, assistantTokens, toolMessageTokens,
-                toolCount, toolsSchemaTokens, estimatedTotal);
+        log.info("LLM request context [{}]: messages={}, images={}, tools={}, {}",
+                scope, budget.messageCount(), imageParts, budget.toolDefinitionCount(),
+                budget.diagnosticText());
         if (!imageDetails.isEmpty()) {
             log.info("LLM request images [{}]: {}", scope, imageDetails);
         }
@@ -912,13 +919,6 @@ public class Agent {
         }
     }
 
-    private static String formatLine(String label, int tokens, int window, int count) {
-        double pct = window > 0 ? (double) tokens / window * 100 : 0;
-        String countLabel = count >= 0 ? String.format("  [%d 条]", count) : "";
-        return String.format("    %-18s %8s  (%4.1f%%)%s%n",
-                label + ":", formatTokens(tokens), pct, countLabel);
-    }
-
     private static String progressBar(double ratio, int width) {
         ratio = Math.max(0, Math.min(1, ratio));
         int filled = (int) Math.round(ratio * width);
@@ -930,7 +930,7 @@ public class Agent {
         return bar.toString();
     }
 
-    private static String formatTokens(int tokens) {
+    private static String formatTokens(long tokens) {
         if (tokens >= 1_000_000) return String.format("%.1fM", tokens / 1_000_000.0);
         if (tokens >= 1_000)     return String.format("%.1fk", tokens / 1_000.0);
         return String.valueOf(tokens);

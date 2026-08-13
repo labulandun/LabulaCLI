@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.paicli.runtime.CancellationContext;
 import com.paicli.runtime.CancellationToken;
 import com.paicli.runtime.ResilienceConfig;
+import com.paicli.context.RequestContextEstimator;
 import okhttp3.*;
 import okio.BufferedSource;
 
@@ -67,6 +68,9 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
 
     @Override
     public ChatResponse chat(List<Message> messages, List<Tool> tools, StreamListener listener) throws IOException {
+        // Transport-level defense in depth. Business paths perform the same check before
+        // committing a history projection, while this also protects direct client callers.
+        RequestContextEstimator.forClient(this).validate(messages, tools);
         StreamListener streamListener = listener == null ? StreamListener.NO_OP : listener;
         AtomicBoolean streamedOutput = new AtomicBoolean(false);
         StreamListener trackingListener = new StreamListener() {
@@ -363,9 +367,7 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
     }
 
     private ObjectNode buildRequestBody(List<Message> messages, List<Tool> tools) {
-        ObjectNode requestBody = mapper.createObjectNode();
-        requestBody.put("model", getModel());
-        requestBody.put("stream", true);
+        ObjectNode requestBody = LlmRequestWireFormat.requestEnvelope(mapper, this);
 
         ArrayNode messagesArray = requestBody.putArray("messages");
         for (Message msg : messages) {
@@ -397,21 +399,9 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
         }
 
         if (tools != null && !tools.isEmpty()) {
-            ArrayNode toolsArray = requestBody.putArray("tools");
-            for (Tool tool : tools) {
-                ObjectNode toolNode = toolsArray.addObject();
-                toolNode.put("type", "function");
-                ObjectNode functionNode = toolNode.putObject("function");
-                functionNode.put("name", tool.name());
-                functionNode.put("description", tool.description());
-                functionNode.set("parameters", tool.parameters());
-            }
+            requestBody.set("tools", LlmRequestWireFormat.toolDefinitions(mapper, tools));
         }
-        customizeRequestBody(requestBody);
         return requestBody;
-    }
-
-    protected void customizeRequestBody(ObjectNode requestBody) {
     }
 
     private void appendMessageContent(ObjectNode msgNode, Message msg) {
@@ -455,6 +445,9 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
             return part.imageUrl();
         }
         if ("image_base64".equals(part.type())) {
+            if (part.imageBase64() == null || part.imageBase64().isBlank()) {
+                return null;
+            }
             String mimeType = part.mimeType() == null || part.mimeType().isBlank() ? "image/png" : part.mimeType();
             return "data:" + mimeType + ";base64," + part.imageBase64();
         }

@@ -1,10 +1,12 @@
 # Phase 24: ConversationHistoryCompactor 结构化摘要
 
+> 历史说明：本文记录 Phase 24 当时的结构化摘要升级。Phase 90.2 已把“原地压缩 conversationHistory”改为“完整 source history → 不可变 model view”，并增加 checkpoint/digest/失败校验；Phase 90.3 已加入完整请求 soft/hard 预算。以下带“当时/本阶段”的描述不能作为当前运行时行为依据。
+
 本阶段目标：把 `ConversationHistoryCompactor` 的自由文本摘要升级为固定 Markdown 结构的恢复快照，让长对话压缩后仍能保留用户意图、当前工作、待办、关键文件、错误修复和下一步。
 
 ## 背景与动机
 
-`ConversationHistoryCompactor` 负责压缩 Agent 实际发给 LLM 的 `conversationHistory`。旧摘要 prompt 要求输出 1-3 段自然语言，虽然简洁，但缺少结构化约束：当前目标、正在做的事、用户明确要求、涉及文件、错误修复和待办事项都可能混在段落里，后续模型读取时容易遗漏关键约束。
+Phase 24 当时，`ConversationHistoryCompactor` 负责压缩 Agent 发给 LLM 的 `conversationHistory`。当前实现不再修改 source history，只把结构化摘要放进派生 model view。旧摘要 prompt 要求输出 1-3 段自然语言，虽然简洁，但缺少结构化约束：当前目标、正在做的事、用户明确要求、涉及文件、错误修复和待办事项都可能混在段落里，后续模型读取时容易遗漏关键约束。
 
 本阶段只调整摘要生成契约，不改变压缩触发条件、user 边界切分、保留最近轮次、工具调用参数提取和回灌结构。
 
@@ -13,7 +15,7 @@
 | 维度 | 决定 | 理由 |
 |------|------|------|
 | 输出格式 | 固定 Markdown 标题 | 直接给后续 LLM 阅读，不引入 JSON 解析失败风险 |
-| 摘要范围 | 压缩旧 `conversationHistory` | 继续保持压缩对象是实际 LLM 输入消息 |
+| 摘要范围 | 当时压缩旧 `conversationHistory`；当前总结 source prefix | Phase 90.2 后 source 不被摘要覆盖 |
 | 用户消息 | 必须覆盖所有非 tool result 的 user message | 用户限制、否定条件和明确要求不能在压缩中丢失 |
 | 当前工作 | 独立成段并要求细颗粒度 | 压缩后恢复任务时，最容易丢的是“正在做到哪一步” |
 | 安全边界 | 明确摘要是历史状态快照，不是新指令 | 降低工具输出、网页内容或旧历史里的指令污染后续任务的风险 |
@@ -67,7 +69,7 @@
 - 新增明确规则：摘要是历史状态快照，不是新的用户指令。
 - 要求保留文件路径、命令、错误信息、用户否定条件和未完成事项。
 - 要求工具结果只提炼关键结果，不复述大段原文。
-- 保留现有压缩算法：仍按 token 阈值触发，仍在 user message 边界切分，仍保留最近 `retainRecentRounds` 个 user 起算的尾部。
+- 保留 Phase 24 当时的切割行为；当前仍在 user message 边界切分并保留最近 `retainRecentRounds` 个 user 起算的尾部，但触发使用 Phase 90.3 完整请求 accounting，摘要只进入 model view。
 
 ### `ConversationHistoryCompactorTest.java`
 
@@ -80,15 +82,15 @@
 
 ## 非目标
 
-- 不改压缩触发阈值。
-- 不改压缩后消息回灌方式。
+- Phase 24 当时不改压缩触发阈值；Phase 90.3 现已把它改为 hard input ceiling 的 90%。
+- Phase 24 当时不改压缩后消息回灌；Phase 90.2 现已禁止摘要/ack 回写 source。
 - 不引入 SubAgent 做摘要。
 - 不做 JSON 输出和解析。
-- 不处理“压缩后仍超预算”的二次压缩策略；这是后续可独立处理的问题。
+- Phase 24 当时不处理“压缩后仍超预算”；Phase 90.3 现会在 provider 前本地拒绝并返回 `CONTEXT_VIEW_BUILD_FAILED`。
 
 ## 风险与边界
 
-- LLM 仍可能不完全遵守模板；当前只通过 prompt 约束，没有后处理校验。
+- LLM 仍可能不完全遵守模板；摘要输入会先剥离 reasoning，摘要结果若为空白、超长、缺标题或仍包含显式 reasoning 容器则判为无效，不提交 checkpoint。
 - `All User Messages` 在极长会话里会增加摘要长度，但这是为了保留用户明确要求和否定条件做出的取舍。
 - 结构化模板提升可读性和恢复能力，但不能完全避免摘要丢失细节。
 

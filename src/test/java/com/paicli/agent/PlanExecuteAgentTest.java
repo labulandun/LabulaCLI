@@ -1,6 +1,7 @@
 package com.paicli.agent;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.paicli.context.ContextProfile;
 import com.paicli.llm.GLMClient;
 import com.paicli.llm.LlmClient;
 import com.paicli.memory.LongTermMemory;
@@ -237,11 +238,13 @@ class PlanExecuteAgentTest {
                         "image result",
                         List.of(LlmClient.ContentPart.imageBase64(imagePayload, "image/png"))));
         ImageProjectionClient client = new ImageProjectionClient();
+        MemoryManager projectionMemory = new MemoryManager(client);
+        projectionMemory.applyContextProfile(ContextProfile.custom(14_000, 6_000, 0, 0));
         PlanExecuteAgent agent = new PlanExecuteAgent(
                 client,
                 registry,
                 new StubPlanner(client),
-                null,
+                projectionMemory,
                 (goal, plan) -> PlanExecuteAgent.PlanReviewDecision.execute());
 
         assertTrue(agent.run("first image task").contains("计划执行完成"));
@@ -382,7 +385,7 @@ class PlanExecuteAgentTest {
 
         @Override
         public int maxContextWindow() {
-            return 8_000;
+            return 32_000;
         }
 
         private static String validProjectionSummary() {

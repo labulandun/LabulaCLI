@@ -11,6 +11,9 @@ import com.paicli.memory.ConversationHistoryCompactor;
 import com.paicli.memory.HistoryProjectionResult;
 import com.paicli.memory.HistoryProjectionState;
 import com.paicli.context.ContextProfile;
+import com.paicli.context.ContextViewBuildException;
+import com.paicli.context.RequestContextBudget;
+import com.paicli.context.RequestContextEstimator;
 import com.paicli.prompt.PromptAssembler;
 import com.paicli.prompt.PromptContext;
 import com.paicli.prompt.PromptMode;
@@ -59,6 +62,10 @@ public class SubAgent {
     private List<LlmClient.Message> lastModelConversationView = List.of();
     private final PromptAssembler promptAssembler = PromptAssembler.createDefault();
 
+    private record PreparedRequest(HistoryProjectionResult projection,
+                                   RequestContextBudget budget) {
+    }
+
     public SubAgent(String name, AgentRole role, LlmClient llmClient, ToolRegistry toolRegistry) {
         this.name = name;
         this.role = role;
@@ -102,27 +109,33 @@ public class SubAgent {
         };
     }
 
-    private HistoryProjectionResult projectHistory(PrintStream out) {
+    private PreparedRequest prepareHistoryRequest(List<LlmClient.Tool> tools, PrintStream out)
+            throws ContextViewBuildException {
         ContextProfile profile = toolRegistry == null ? null : toolRegistry.getContextProfile();
-        int trigger = profile == null ? Integer.MAX_VALUE : profile.compressionTriggerTokens();
+        RequestContextEstimator estimator = new RequestContextEstimator(llmClient, profile);
         try {
             HistoryProjectionResult projection = historyCompactor.project(
                     conversationHistory,
                     historyProjectionState,
-                    trigger,
+                    estimator,
+                    tools,
                     shouldUseTools()
                             ? toolRegistry.getToolResultArtifactIndex()
                             : com.paicli.tool.ToolResultArtifactIndex.empty());
+            RequestContextBudget budget = estimator.validate(projection.modelMessages(), tools);
+            // Keep state atomic with the complete request hard-ceiling check.
+            historyProjectionState = projection.nextState();
             if (projection.checkpointAdvanced() && out != null) {
                 out.println("📦 [" + name + "] 上下文接近窗口上限，已把早期对话压缩为摘要后继续。");
             }
-            historyProjectionState = projection.nextState();
-            return projection;
+            return new PreparedRequest(projection, budget);
+        } catch (ContextViewBuildException e) {
+            throw e;
         } catch (Exception e) {
             log.warn("[{}] conversationHistory projection failed; using immutable source snapshot", name, e);
             List<LlmClient.Message> sourceSnapshot = List.copyOf(conversationHistory);
             int tokens = com.paicli.memory.TokenBudget.estimateMessagesTokens(sourceSnapshot);
-            return new HistoryProjectionResult(
+            HistoryProjectionResult fallback = new HistoryProjectionResult(
                     sourceSnapshot,
                     historyProjectionState,
                     false,
@@ -133,6 +146,9 @@ public class SubAgent {
                     tokens,
                     tokens,
                     true);
+            return new PreparedRequest(
+                    fallback,
+                    estimator.validate(fallback.modelMessages(), tools));
         }
     }
 
@@ -226,13 +242,18 @@ public class SubAgent {
 
             // source history 始终保留；这里只构建本轮不可变 model view。
             injectPendingLspDiagnostics(out);
-            HistoryProjectionResult projection = projectHistory(out);
-
             try {
+                List<LlmClient.Tool> toolDefinitions = shouldUseTools()
+                        ? toolRegistry.getToolDefinitions()
+                        : null;
+                PreparedRequest prepared = prepareHistoryRequest(toolDefinitions, out);
+                HistoryProjectionResult projection = prepared.projection();
                 lastModelConversationView = projection.modelMessages();
+                log.info("LLM request context [sub-agent name={} role={} iteration={}]: {}",
+                        name, role, budget.iteration(), prepared.budget().diagnosticText());
                 LlmClient.ChatResponse response = llmClient.chat(
                         lastModelConversationView,
-                        shouldUseTools() ? toolRegistry.getToolDefinitions() : null,
+                        toolDefinitions,
                         streamRenderer
                 );
                 LlmTraceLogger.logReasoning(log,
@@ -275,6 +296,11 @@ public class SubAgent {
 
                 return AgentMessage.result(name, role, response.content());
 
+            } catch (ContextViewBuildException e) {
+                log.warn("[{}] LLM request blocked by context hard ceiling: {}",
+                        name, e.budget().diagnosticText());
+                streamRenderer.finish();
+                return AgentMessage.error(name, role, e.getMessage());
             } catch (LlmTimeoutException e) {
                 log.warn("[{}] LLM call timed out: phase={}", name, e.phase());
                 streamRenderer.finish();

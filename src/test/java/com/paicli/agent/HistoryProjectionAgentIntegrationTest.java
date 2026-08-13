@@ -28,7 +28,7 @@ class HistoryProjectionAgentIntegrationTest {
             Agent agent = new Agent(client, registry("react-artifacts"));
 
             for (int i = 0; i < 4; i++) {
-                assertEquals("business-answer", agent.run("react-turn-" + i + " " + "x".repeat(8_000)));
+                assertEquals("business-answer", agent.run("react-turn-" + i + " " + "x".repeat(20_000)));
             }
 
             List<LlmClient.Message> source = agent.getConversationHistory();
@@ -73,13 +73,13 @@ class HistoryProjectionAgentIntegrationTest {
     void workerSubAgentSeparatesSourceAndViewAndClearDoesNotRotateSharedArtifacts() {
         ProjectionAwareClient client = new ProjectionAwareClient(true);
         ToolRegistry registry = registry("worker-artifacts");
-        registry.setContextProfile(ContextProfile.custom(8_000, 4_000));
+        registry.setContextProfile(ContextProfile.custom(32_000, 14_000));
         SubAgent worker = new SubAgent("worker", AgentRole.WORKER, client, registry);
 
         String manifestBefore = registry.getToolResultManifestHandle();
         for (int i = 0; i < 4; i++) {
             AgentMessage result = worker.execute(AgentMessage.task(
-                    "orchestrator", "worker-turn-" + i + " " + "x".repeat(8_000)));
+                    "orchestrator", "worker-turn-" + i + " " + "x".repeat(20_000)));
             assertEquals(AgentMessage.Type.RESULT, result.type());
         }
 
@@ -180,7 +180,7 @@ class HistoryProjectionAgentIntegrationTest {
 
         @Override
         public int maxContextWindow() {
-            return 8_000;
+            return 32_000;
         }
 
         @Override

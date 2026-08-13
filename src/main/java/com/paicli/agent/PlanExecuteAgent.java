@@ -6,6 +6,9 @@ import com.paicli.llm.LlmClient;
 import com.paicli.llm.LlmCancelledException;
 import com.paicli.llm.LlmTimeoutException;
 import com.paicli.llm.LlmTraceLogger;
+import com.paicli.context.ContextViewBuildException;
+import com.paicli.context.RequestContextBudget;
+import com.paicli.context.RequestContextEstimator;
 import com.paicli.lsp.LspDiagnosticReport;
 import com.paicli.memory.ConversationHistoryCompactor;
 import com.paicli.memory.HistoryProjectionResult;
@@ -191,25 +194,32 @@ public class PlanExecuteAgent {
         this.skillContextBuffer = skillContextBuffer;
     }
 
-    private HistoryProjectionResult projectHistory(List<LlmClient.Message> messages,
-                                                   HistoryProjectionState state,
-                                                   PrintStream out) {
-        int trigger = memoryManager.getContextProfile().compressionTriggerTokens();
+    private PreparedTaskRequest prepareHistoryRequest(List<LlmClient.Message> messages,
+                                                      HistoryProjectionState state,
+                                                      List<LlmClient.Tool> tools,
+                                                      PrintStream out)
+            throws ContextViewBuildException {
+        RequestContextEstimator estimator = new RequestContextEstimator(
+                llmClient, memoryManager.getContextProfile());
         try {
             HistoryProjectionResult projection = historyCompactor.project(
                     messages,
                     state,
-                    trigger,
+                    estimator,
+                    tools,
                     toolRegistry.getToolResultArtifactIndex());
+            RequestContextBudget budget = estimator.validate(projection.modelMessages(), tools);
             if (projection.checkpointAdvanced() && out != null) {
                 out.println("📦 上下文接近窗口上限，已把早期对话压缩为摘要后继续。");
             }
-            return projection;
+            return new PreparedTaskRequest(projection, budget);
+        } catch (ContextViewBuildException e) {
+            throw e;
         } catch (Exception e) {
             log.warn("plan task history projection failed; using immutable source snapshot", e);
             List<LlmClient.Message> sourceSnapshot = List.copyOf(messages);
             int tokens = com.paicli.memory.TokenBudget.estimateMessagesTokens(sourceSnapshot);
-            return new HistoryProjectionResult(
+            HistoryProjectionResult fallback = new HistoryProjectionResult(
                     sourceSnapshot,
                     state,
                     false,
@@ -220,7 +230,14 @@ public class PlanExecuteAgent {
                     tokens,
                     tokens,
                     true);
+            return new PreparedTaskRequest(
+                    fallback,
+                    estimator.validate(fallback.modelMessages(), tools));
         }
+    }
+
+    private record PreparedTaskRequest(HistoryProjectionResult projection,
+                                       RequestContextBudget budget) {
     }
 
     private String buildSkillIndex() {
@@ -376,7 +393,8 @@ public class PlanExecuteAgent {
                 out.println("❌ 失败 [" + task.getId() + "]: " + error.getMessage() + "\n");
 
                 boolean timeoutFailure = error instanceof LlmTimeoutException
-                        || error instanceof TimeoutException;
+                        || error instanceof TimeoutException
+                        || error instanceof ContextViewBuildException;
                 if (!timeoutFailure && plan.getProgress() < 0.5) {
                     out.println("🔄 尝试重新规划...\n");
                     ExecutionPlan replanned = planner.replan(plan, error.getMessage());
@@ -604,12 +622,18 @@ public class PlanExecuteAgent {
 
             // Keep task source messages intact and derive only the immutable request view.
             injectPendingLspDiagnostics(messages, out);
-            HistoryProjectionResult projection = projectHistory(messages, projectionState, out);
+            List<LlmClient.Tool> toolDefinitions = toolRegistry.getToolDefinitions();
+            PreparedTaskRequest prepared = prepareHistoryRequest(
+                    messages, projectionState, toolDefinitions, out);
+            HistoryProjectionResult projection = prepared.projection();
             projectionState = projection.nextState();
+
+            log.info("LLM request context [plan-task task={} iteration={}]: {}",
+                    task.getId(), iteration, prepared.budget().diagnosticText());
 
             LlmClient.ChatResponse response = llmClient.chat(
                     projection.modelMessages(),
-                    toolRegistry.getToolDefinitions(),
+                    toolDefinitions,
                     streamRenderer
             );
             LlmTraceLogger.logReasoning(log,

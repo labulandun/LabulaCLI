@@ -100,6 +100,8 @@ scheme 白名单(http/https) / 主机黑名单(localhost/loopback/link-local/sit
 
 - `ContextProfile` 按模型 `maxContextWindow` 统一派生预算和阈值，不再维护 short/balanced/long 模式分档
 - GLM-5.1: 200k / DeepSeek V4: 1M / StepFun: 256k / Kimi K2.6: 256k / FreeLLMAPI: 128k
+- 完整请求估算由 `RequestContextEstimator` 统一组成：message/contentParts/image、仅 provider 实际 replay 的 reasoning、tool-call id/name/arguments、tool_call_id、message framing、实际 tools wire schema 和 request envelope；cached input 仍占窗口
+- `hardInputCeiling = window - responseReserve - safetyMargin`；response reserve 默认 8,192（clamp 到 window 25%），safety 默认 `max(2,048, window 1%)`（clamp 到 window 10%），soft compression trigger 为 hard ceiling 的 90%
 - MCP resources 索引在 window >=32k 时启用；精确代码定位优先实时 glob/grep/read，search_code 保留为语义辅助
 - prompt caching：能力声明 + cached usage 解析
 
@@ -112,7 +114,8 @@ scheme 白名单(http/https) / 主机黑名单(localhost/loopback/link-local/sit
 - ReAct、Plan task、Worker SubAgent 的业务 `chat()` 都只发送 model view；当前 system prompt 每轮直接进入 view，artifact manifest/count/latest handle 作为动态恢复索引附加
 - 摘要输出限制为 16,000 chars / 约 4,096 estimated tokens；失败不提交 checkpoint，有旧 checkpoint 时保留旧摘要并携带完整当前 tail，否则发送 source 快照
 - `/clear`、项目切换、模型切换及 SubAgent/Plan 新任务重置 projection state；`getConversationHistory()` 仍是 source，`getLastModelConversationView()` 用于调试最近请求
-- 当前压缩触发仍是消息级启发式估算；完整 tools schema/replayed reasoning/framing/response reserve/safety/hard ceiling 在 Phase 90.3 实现
+- ReAct、Plan task、Worker SubAgent 以同一完整请求估算触发投影；Planner、摘要请求和 short-term compressor 也在 provider 前执行 hard gate。任何包含完整当前 tail 的候选超限时不发送请求、不提交新 checkpoint，并返回 `CONTEXT_VIEW_BUILD_FAILED`
+- `/context`、底部 `ctx` 与 request log 共用 estimated input 口径；headless Runtime/Durable Task 将 `CONTEXT_VIEW_BUILD_FAILED` 映射为 failed。估算不是 provider 官方 tokenizer，response reserve 也不等同于 provider `max_tokens`
 - 长期记忆只通过 `/save` 或用户明确要求保存
 - 长期记忆只保存跨会话稳定事实，不保存临时指令；默认项目级作用域，跨项目通用偏好才用 global
 - 长期记忆管理命令：`/memory list`、`/memory search <关键词>`、`/memory delete <id>`、`/memory clear`
@@ -265,6 +268,8 @@ DAG 拓扑排序 / 可执行任务判定 / 进度可视化
 工具工件默认目录为 `~/.paicli/context-artifacts/<project-hash>/<session-id>/`；单工件 32 MiB、session 256 MiB、保留 7 天（成功读取会刷新 session 访问时间，启动时清理超过留存期且未访问的旧目录）。配置读取遵循 system property > environment > 项目 `.env` > 用户 `~/.env` > 默认值：`paicli.tool.result.dir` / `.spill.tokens` / `.retention.days`。工件正文不自动脱敏且是本机明文；producer 在 ToolRegistry 之前已经截断的内容不属于可恢复承诺。
 
 Phase 90.2 的 `ToolResultArtifactIndex` 从 store 内存 manifest 取得稳定 handle、当前 count 和最近 5 个工件元数据；同 session 新工件只刷新 model view 中的动态索引，不使 summary checkpoint 失效。`/clear` 或项目 rebind 改变 manifest handle，会与 projection state 一起失效。
+
+Phase 90.3 的 `LlmRequestWireFormat` 是 transport 与 estimator 的 tools schema/request envelope 共同来源；DeepSeek/Kimi 的 reasoning replay 能力和 Step `reasoning_format` / `reasoning_effort` request fields 由 `LlmClient` 能力声明统一透传。配置读取遵循既有优先级：`paicli.context.response.reserve.tokens` / `PAICLI_CONTEXT_RESPONSE_RESERVE_TOKENS`、`paicli.context.safety.margin.tokens` / `PAICLI_CONTEXT_SAFETY_MARGIN_TOKENS`。
 
 `/index <新路径>` 改变项目根时会同步清空旧 conversation history/short-term memory 并切换 artifact session，避免旧项目句柄进入新 scope 后反复读取失败。
 

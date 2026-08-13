@@ -1,6 +1,7 @@
 package com.paicli.llm;
 
-import com.fasterxml.jackson.databind.node.ObjectNode;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 public class StepClient extends AbstractOpenAiCompatibleClient {
 
@@ -61,13 +62,15 @@ public class StepClient extends AbstractOpenAiCompatibleClient {
     }
 
     @Override
-    protected void customizeRequestBody(ObjectNode requestBody) {
+    public Map<String, Object> requestEnvelopeFields() {
         // StepFun 默认 reasoning_format=general，会返回 `reasoning` 字段；
         // deepseek-style 让它返回 PaiCLI/DeepSeek 兼容的 `reasoning_content`。
-        requestBody.put("reasoning_format", "deepseek-style");
+        Map<String, Object> fields = new LinkedHashMap<>();
+        fields.put("reasoning_format", "deepseek-style");
         if (model != null && model.contains("2603")) {
-            requestBody.put("reasoning_effort", "high");
+            fields.put("reasoning_effort", "high");
         }
+        return Map.copyOf(fields);
     }
 
     private static String toChatCompletionsUrl(String baseUrl) {

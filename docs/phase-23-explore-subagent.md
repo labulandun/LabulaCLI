@@ -1,5 +1,7 @@
 # Phase 23: 代码检索子 Agent（Explore / Dispatch Agent）
 
+> 历史说明：本文记录 Phase 23 当时的探索隔离方案。Phase 90.1 后 Explore 与主 Agent 共享只读 artifact scope，Phase 90.2 后 conversationHistory 使用 source/model-view 分离，Phase 90.3 后单次请求由完整 accounting/hard ceiling 保护；下文 `maybeCompactHistory` / `AgentBudget` 的旧口径不能作为当前实现说明。
+
 本阶段目标：对齐 Claude Code 的 Explore / Task agent 设计，新增一个**只读的代码检索子 Agent**。当主 Agent 预判某个子任务需要多轮检索时，把整段检索委托给子 Agent，子 Agent 在**独立上下文**里跑多轮 `glob_files` / `grep_code` / `read_file`，只把**精炼结论**回传，主 Agent 上下文只增长一条结果消息而非几十条 `tool_result`。
 
 参考：Claude Code 的 Agent / Task 工具（dispatch agent，隔离上下文 + 返回压缩结果）。

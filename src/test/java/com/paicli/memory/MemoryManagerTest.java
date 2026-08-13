@@ -93,7 +93,7 @@ class MemoryManagerTest {
 
         assertEquals(0.90, memoryManager.getContextProfile().compressionTriggerRatio(), 0.001);
         assertEquals(200000, memoryManager.getTokenBudget().getContextWindow());
-        assertEquals(180000, memoryManager.getContextProfile().compressionTriggerTokens());
+        assertEquals(170784, memoryManager.getContextProfile().compressionTriggerTokens());
     }
 
     @Test

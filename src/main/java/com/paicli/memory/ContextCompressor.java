@@ -1,5 +1,6 @@
 package com.paicli.memory;
 
+import com.paicli.context.RequestContextEstimator;
 import com.paicli.llm.LlmClient;
 
 import java.io.IOException;
@@ -162,6 +163,7 @@ public class ContextCompressor {
                     LlmClient.Message.user(prompt)
             );
 
+            RequestContextEstimator.forClient(llmClient).validate(messages, null);
             LlmClient.ChatResponse response = llmClient.chat(messages, null);
             String factsText = response.content();
 
@@ -211,6 +213,7 @@ public class ContextCompressor {
                         LlmClient.Message.user(prompt)
                 );
 
+                RequestContextEstimator.forClient(llmClient).validate(messages, null);
                 LlmClient.ChatResponse response = llmClient.chat(messages, null);
                 summaries.add(response.content());
             } catch (IOException e) {
@@ -237,6 +240,7 @@ public class ContextCompressor {
                     LlmClient.Message.user(prompt)
             );
 
+            RequestContextEstimator.forClient(llmClient).validate(messages, null);
             LlmClient.ChatResponse response = llmClient.chat(messages, null);
             return response.content();
         } catch (IOException e) {

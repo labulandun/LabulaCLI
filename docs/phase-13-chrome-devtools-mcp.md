@@ -1,5 +1,7 @@
 # 第 13 期开发任务：Chrome DevTools MCP（接入 + 适配 + UX 优化）
 
+> 历史说明：本文记录 Phase 13 当时的设计、版本选择和验收清单；其中 `@latest`、工具/星数、Banner 与待办语气不代表当前运行时状态。现行能力以 `AGENTS.md`、`README.md` 和代码为准。
+>
 > 这份文档是给执行 Agent 的开发任务说明书，自包含、可直接照着推进。
 >
 > **开工前必读**：
@@ -141,10 +143,10 @@ chrome-devtools server 首次启动可能 30s+（npx 拉包 + Chrome 冷启）�
 
 ### 3.5 工具列表膨胀的处理
 
-加上 chrome-devtools 后总工具数 ≈ 60，system prompt 里 tools schema 占用 8-10k token。第 13 期**不做特殊处理**（默认 enabled），但要在文档里告知用户：
+加上 chrome-devtools 后总工具数 ≈ 60，system prompt 里 tools schema 占用 8-10k token。第 13 期当时**不做特殊处理**（默认 enabled）；Phase 90.3 现已按每轮实际 tools wire schema 纳入 soft trigger / hard ceiling：
 - 用 `/mcp disable chrome-devtools` 临时关闭可瘦身
-- 长上下文模型（GLM-5.1 200k / DeepSeek V4 1M）下完全无压力
-- 短窗口模型（< 32k）下用户可自己决定
+- 长上下文模型通常余量更大，但 schema 仍参与完整预算，不能再视为“完全无压力”
+- 短窗口或 schema 动态膨胀时可能提前触发 model-view 投影；仍超 hard ceiling 则本地拒绝请求
 
 ### 3.6 系统提示词升级
 

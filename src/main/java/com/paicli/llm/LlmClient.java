@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Map;
 import java.util.List;
 
 public interface LlmClient {
@@ -32,6 +33,15 @@ public interface LlmClient {
     /** Whether assistant reasoning content is serialized again in later request history. */
     default boolean replaysReasoningContent() {
         return false;
+    }
+
+    /**
+     * Provider-specific top-level request fields that are sent in addition to model/stream,
+     * messages and tools. Phase 90.3 exposes them so wire construction and request accounting
+     * use the same source of truth.
+     */
+    default Map<String, Object> requestEnvelopeFields() {
+        return Map.of();
     }
 
     record ContentPart(String type, String text, String imageBase64, String imageUrl, String mimeType) {

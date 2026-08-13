@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -77,16 +78,22 @@ class TracingLlmClientTest {
     }
 
     @Test
-    void forwardsReasoningReplayCapability() {
+    void forwardsRequestAccountingCapabilities() {
         LlmClient delegate = new FixedLlmClient() {
             @Override
             public boolean replaysReasoningContent() {
                 return true;
             }
+
+            @Override
+            public Map<String, Object> requestEnvelopeFields() {
+                return Map.of("reasoning_effort", "high");
+            }
         };
         LlmClient traced = PaiCliTracing.noop().traceLlmClient(delegate);
 
         assertTrue(traced.replaysReasoningContent());
+        assertEquals(Map.of("reasoning_effort", "high"), traced.requestEnvelopeFields());
     }
 
     private static String stringAttribute(SpanData span, String key) {

@@ -8,6 +8,7 @@ import io.opentelemetry.context.Scope;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 final class TracingLlmClient implements LlmClient {
@@ -57,6 +58,11 @@ final class TracingLlmClient implements LlmClient {
     @Override
     public boolean replaysReasoningContent() {
         return delegate.replaysReasoningContent();
+    }
+
+    @Override
+    public Map<String, Object> requestEnvelopeFields() {
+        return delegate.requestEnvelopeFields();
     }
 
     private ChatResponse trace(List<Message> messages, IoCall call) throws IOException {

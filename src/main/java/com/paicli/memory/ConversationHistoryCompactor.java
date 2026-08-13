@@ -1,5 +1,6 @@
 package com.paicli.memory;
 
+import com.paicli.context.RequestContextEstimator;
 import com.paicli.llm.LlmClient;
 import com.paicli.tool.ToolResultArtifactIndex;
 import com.paicli.tool.ToolResultArtifactRef;
@@ -154,6 +155,32 @@ public class ConversationHistoryCompactor {
             HistoryProjectionState previousState,
             int triggerTokens,
             ToolResultArtifactIndex artifactIndex) {
+        return previewModelMessages(sourceHistory, previousState, triggerTokens, artifactIndex,
+                TokenBudget::estimateMessagesTokens);
+    }
+
+    /** Preview using the same complete request accounting as the eventual provider call. */
+    public List<LlmClient.Message> previewModelMessages(
+            List<LlmClient.Message> sourceHistory,
+            HistoryProjectionState previousState,
+            RequestContextEstimator estimator,
+            List<LlmClient.Tool> tools,
+            ToolResultArtifactIndex artifactIndex) {
+        RequestContextEstimator requestEstimator = Objects.requireNonNull(estimator, "estimator");
+        return previewModelMessages(
+                sourceHistory,
+                previousState,
+                requestEstimator.profile().compressionTriggerTokens(),
+                artifactIndex,
+                view -> requestTokens(requestEstimator, view, tools));
+    }
+
+    private List<LlmClient.Message> previewModelMessages(
+            List<LlmClient.Message> sourceHistory,
+            HistoryProjectionState previousState,
+            int triggerTokens,
+            ToolResultArtifactIndex artifactIndex,
+            ViewTokenEstimator viewEstimator) {
         List<LlmClient.Message> source = sourceHistory == null
                 ? List.of()
                 : List.copyOf(sourceHistory);
@@ -165,7 +192,7 @@ public class ConversationHistoryCompactor {
                 : artifactIndex;
         int systemEnd = systemEnd(source);
         List<LlmClient.Message> rawView = buildRawView(source, systemEnd, artifacts);
-        if (TokenBudget.estimateMessagesTokens(rawView) < Math.max(1, triggerTokens)) {
+        if (viewEstimator.estimate(rawView) < Math.max(1, triggerTokens)) {
             return rawView;
         }
         SummaryCheckpoint checkpoint = validateCheckpoint(state, source, systemEnd, artifacts);
@@ -182,6 +209,32 @@ public class ConversationHistoryCompactor {
                                            HistoryProjectionState previousState,
                                            int triggerTokens,
                                            ToolResultArtifactIndex artifactIndex) {
+        return project(sourceHistory, previousState, triggerTokens, artifactIndex,
+                TokenBudget::estimateMessagesTokens, null);
+    }
+
+    /** Projects using complete request accounting, including the actual tools wire schema. */
+    public HistoryProjectionResult project(List<LlmClient.Message> sourceHistory,
+                                           HistoryProjectionState previousState,
+                                           RequestContextEstimator estimator,
+                                           List<LlmClient.Tool> tools,
+                                           ToolResultArtifactIndex artifactIndex) {
+        RequestContextEstimator requestEstimator = Objects.requireNonNull(estimator, "estimator");
+        return project(
+                sourceHistory,
+                previousState,
+                requestEstimator.profile().compressionTriggerTokens(),
+                artifactIndex,
+                view -> requestTokens(requestEstimator, view, tools),
+                requestEstimator);
+    }
+
+    private HistoryProjectionResult project(List<LlmClient.Message> sourceHistory,
+                                            HistoryProjectionState previousState,
+                                            int triggerTokens,
+                                            ToolResultArtifactIndex artifactIndex,
+                                            ViewTokenEstimator viewEstimator,
+                                            RequestContextEstimator summaryEstimator) {
         List<LlmClient.Message> source = sourceHistory == null
                 ? List.of()
                 : List.copyOf(sourceHistory);
@@ -194,6 +247,7 @@ public class ConversationHistoryCompactor {
         int systemEnd = systemEnd(source);
         List<LlmClient.Message> rawView = buildRawView(source, systemEnd, artifacts);
         int beforeTokens = TokenBudget.estimateMessagesTokens(rawView);
+        int beforeRequestTokens = viewEstimator.estimate(rawView);
 
         SummaryCheckpoint validCheckpoint = validateCheckpoint(
                 state, source, systemEnd, artifacts);
@@ -204,7 +258,7 @@ public class ConversationHistoryCompactor {
                 validCheckpoint, source, systemEnd);
         int trigger = Math.max(1, triggerTokens);
 
-        if (beforeTokens < trigger) {
+        if (beforeRequestTokens < trigger) {
             return result(rawView, observedValidState, false, false, validCheckpoint,
                     beforeTokens, false);
         }
@@ -212,7 +266,7 @@ public class ConversationHistoryCompactor {
         List<LlmClient.Message> checkpointView = null;
         if (validCheckpoint != null) {
             checkpointView = buildCheckpointView(source, validCheckpoint, artifacts);
-            int checkpointTokens = TokenBudget.estimateMessagesTokens(checkpointView);
+            int checkpointTokens = viewEstimator.estimate(checkpointView);
             if (checkpointTokens < trigger) {
                 return result(checkpointView, observedValidState, true, false, validCheckpoint,
                         beforeTokens, false);
@@ -235,6 +289,12 @@ public class ConversationHistoryCompactor {
         List<LlmClient.Message> newlyCovered = List.copyOf(source.subList(alreadyCovered, split));
         String summary;
         try {
+            if (summaryEstimator != null) {
+                validateSummaryRequest(
+                        summaryEstimator,
+                        validCheckpoint == null ? null : validCheckpoint.summary(),
+                        newlyCovered);
+            }
             summary = validCheckpoint == null
                     ? summarize(newlyCovered)
                     : summarizeIncrementally(validCheckpoint.summary(), newlyCovered);
@@ -271,8 +331,8 @@ public class ConversationHistoryCompactor {
         log.info(String.format(Locale.ROOT,
                 "projected conversation history: tokens %d -> %d, source messages %d, "
                         + "covered [%d,%d), summary chars %d",
-                beforeTokens,
-                TokenBudget.estimateMessagesTokens(modelView),
+                beforeRequestTokens,
+                viewEstimator.estimate(modelView),
                 source.size(),
                 systemEnd,
                 split,
@@ -468,6 +528,21 @@ public class ConversationHistoryCompactor {
         if (llmClient == null) {
             throw new IOException("LLM client not configured");
         }
+        List<LlmClient.Message> request = buildSummaryRequest(previousSummary, messages);
+        RequestContextEstimator.forClient(llmClient).validate(request, null);
+        LlmClient.ChatResponse response = llmClient.chat(request, null);
+        return response == null ? null : response.content();
+    }
+
+    private void validateSummaryRequest(RequestContextEstimator estimator,
+                                        String previousSummary,
+                                        List<LlmClient.Message> messages) throws IOException {
+        estimator.validate(buildSummaryRequest(previousSummary, messages), null);
+    }
+
+    private List<LlmClient.Message> buildSummaryRequest(
+            String previousSummary,
+            List<LlmClient.Message> messages) {
         String prior = previousSummary == null || previousSummary.isBlank()
                 ? "这是首次摘要；只根据下面的源消息生成状态快照。"
                 : """
@@ -477,12 +552,10 @@ public class ConversationHistoryCompactor {
                   请把已有摘要与下面仅新增的源消息合并为一份完整的新摘要；不要重复扩写旧内容。
                   """.formatted(previousSummary.trim());
         String prompt = SUMMARY_PROMPT.formatted(prior, renderSummaryInput(messages));
-        List<LlmClient.Message> request = List.of(
+        return List.of(
                 LlmClient.Message.system("你是一个对话摘要助手，只输出摘要本身，不输出元描述。"),
                 LlmClient.Message.user(prompt)
         );
-        LlmClient.ChatResponse response = llmClient.chat(request, null);
-        return response == null ? null : response.content();
     }
 
     private String renderSummaryInput(List<LlmClient.Message> messages) {
@@ -580,6 +653,18 @@ public class ConversationHistoryCompactor {
 
     private static int systemEnd(List<LlmClient.Message> source) {
         return !source.isEmpty() && "system".equals(source.get(0).role()) ? 1 : 0;
+    }
+
+    private static int requestTokens(RequestContextEstimator estimator,
+                                     List<LlmClient.Message> messages,
+                                     List<LlmClient.Tool> tools) {
+        long tokens = estimator.estimate(messages, tools).estimatedInputTokens();
+        return tokens >= Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) Math.max(0L, tokens);
+    }
+
+    @FunctionalInterface
+    private interface ViewTokenEstimator {
+        int estimate(List<LlmClient.Message> messages);
     }
 
     /** Stable digest of all request-relevant fields in {@code [from, until)}. */

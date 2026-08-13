@@ -25,7 +25,16 @@
 - 每个压缩 view 都确定性附加当前 artifact manifest、数量、最近 handle/digest 和 `read_tool_result` 恢复说明；manifest 内容增长只刷新动态索引，不会让旧摘要失效
 - 摘要为空、异常、超过 16,000 chars / 约 4,096 tokens 或调用失败时不修改 source、不提交新 checkpoint；有有效旧 checkpoint 时使用“旧摘要 + 完整当前 tail”，否则回退到当前 source 的不可变快照
 - `/clear`、项目切换、主 Agent 模型切换及 SubAgent/Plan 新任务会重置各自 projection state；`getConversationHistory()` 仍返回 source 快照，Agent/SubAgent 可用 `getLastModelConversationView()` 查看最近业务请求视图
-- 当前边界：Phase 90.2 仍沿用消息级启发式压缩阈值；tools wire schema、完整 reasoning/request framing、response reserve、安全余量与 hard ceiling 统一核算属于 Phase 90.3，尚未交付
+
+### Phase 90.3：统一请求预算与 hard ceiling
+
+- `RequestContextEstimator` 对每个实际请求统一估算 system/user/assistant/tool 文本、图片、provider 会 replay 的 reasoning、tool-call id/name/arguments、`tool_call_id`、消息 framing、真实 OpenAI-compatible tools wire schema 和 provider request envelope；cached input 仍占上下文窗口，只在成本统计中单列
+- `ContextProfile` 以 `hard input ceiling = window - response reserve - safety margin` 计算单次输入上限，soft compression trigger 改为 hard ceiling 的 90%；默认 response reserve 8,192 tokens（最多 window 25%），safety 为 `max(2,048, window×1%)`（最多 window 10%）
+- ReAct、Plan task、Worker SubAgent、Planner、conversation summary 与 short-term compressor 都在调用 LLM 前执行同一 hard gate；动态 MCP schema 或 Kimi/DeepSeek replay reasoning 变大时会提前触发 model-view 投影
+- projection checkpoint 只有在完整候选通过 hard ceiling 后才提交；任何包含当前 tail 的安全候选仍超限时不调用 provider，返回 `CONTEXT_VIEW_BUILD_FAILED`，Runtime API / Durable Task 的 headless 路径映射为 failed
+- `/context`、底部状态栏 `ctx` 与请求日志统一使用 estimated input 口径；`/context` 另列 source/model view、reasoning、tool schema、framing/envelope、response reserve、safety、soft trigger 与 hard ceiling
+- 配置项：`PAICLI_CONTEXT_RESPONSE_RESERVE_TOKENS`、`PAICLI_CONTEXT_SAFETY_MARGIN_TOKENS`（及 `paicli.context.response.reserve.tokens` / `paicli.context.safety.margin.tokens` 系统属性）；负数/非法值回退默认，0 表示显式不预留
+- 当前估算仍基于启发式 tokenizer；safety 用于覆盖 JSON/tokenizer 偏差，response reserve 是本地窗口预算，不会强制注入 provider `max_tokens`
 
 ### Side-Git 快照隔离
 
