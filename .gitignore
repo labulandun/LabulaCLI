@@ -13,7 +13,14 @@ target/
 
 # 日志
 *.log
+# terminal 日志排查评测所需的固定输入
+!eval/suites/terminal/tm-002-log-triage/fixture/app.log
 
 # 操作系统
 .DS_Store
 Thumbs.db
+
+# 评测运行输出（工作区/工件/报告，只提交 eval/suites 与 eval/baselines）
+# LLM judge content-addressed cache
+eval/cache/
+eval/runs/

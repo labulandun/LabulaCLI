@@ -2,6 +2,9 @@ package com.paicli.runtime.api;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.paicli.observability.PaiCliTracing;
+import com.paicli.runtime.CancellationContext;
+import com.paicli.runtime.CancellationToken;
 import com.paicli.runtime.task.TaskRunner;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
@@ -11,15 +14,21 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Optional;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.function.Supplier;
 
 public class RuntimeApiServer implements AutoCloseable {
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private final RuntimeThreadStore store;
     private final TaskRunner runner;
     private final String apiKey;
+    private final Supplier<Optional<PaiCliTracing.TraceReference>> traceReferenceSupplier;
     private final HttpServer server;
+    private final Map<String, CancellationToken> runningTurns = new ConcurrentHashMap<>();
     private final ExecutorService executor = Executors.newCachedThreadPool(r -> {
         Thread thread = new Thread(r, "paicli-runtime-api");
         thread.setDaemon(true);
@@ -27,14 +36,23 @@ public class RuntimeApiServer implements AutoCloseable {
     });
 
     public RuntimeApiServer(RuntimeThreadStore store, TaskRunner runner, int port, String apiKey) throws IOException {
+        this(store, runner, port, apiKey, Optional::empty);
+    }
+
+    public RuntimeApiServer(RuntimeThreadStore store,
+                            TaskRunner runner,
+                            int port,
+                            String apiKey,
+                            Supplier<Optional<PaiCliTracing.TraceReference>> traceReferenceSupplier) throws IOException {
         if (apiKey == null || apiKey.isBlank()) {
             throw new IllegalArgumentException("Runtime API 需要配置 PAICLI_RUNTIME_API_KEY 或 -Dpaicli.runtime.api.key");
         }
         this.store = store;
         this.runner = runner;
         this.apiKey = apiKey;
-        this.server = HttpServer.create(new InetSocketAddress("127.0.0.1", port), 0);
+        this.server = HttpServer.create(new InetSocketAddress(configuredBindHost(), port), 0);
         this.server.createContext("/v1/threads", this::handleThreads);
+        this.traceReferenceSupplier = traceReferenceSupplier == null ? Optional::empty : traceReferenceSupplier;
         this.server.setExecutor(executor);
     }
 
@@ -44,6 +62,21 @@ public class RuntimeApiServer implements AutoCloseable {
             configured = System.getenv("PAICLI_RUNTIME_API_KEY");
         }
         return configured;
+    }
+
+    /**
+     * 监听地址，默认 127.0.0.1，只有显式配置才放开。
+     *
+     * <p>放开的唯一预期场景是容器内运行：端口映射的数据包到达容器 eth0 而不是 loopback，
+     * 绑定 127.0.0.1 会导致宿主机无法访问。在宿主机上配置这个变量等于把 Agent 运行时
+     * 暴露到网络，只有 API Key 一道防线，不要这么做。</p>
+     */
+    static String configuredBindHost() {
+        String configured = System.getProperty("paicli.runtime.api.host");
+        if (configured == null || configured.isBlank()) {
+            configured = System.getenv("PAICLI_RUNTIME_API_HOST");
+        }
+        return configured == null || configured.isBlank() ? "127.0.0.1" : configured.trim();
     }
 
     public void start() {
@@ -100,15 +133,44 @@ public class RuntimeApiServer implements AutoCloseable {
     }
 
     private void runTurn(String threadId, String turnId, String input) {
+        CancellationToken token = CancellationContext.startRun();
+        runningTurns.put(turnId, token);
         try {
-            String result = runner.run(input);
-            store.appendEvent(threadId, "message.delta",
-                    "{\"turn_id\":\"" + turnId + "\",\"content\":\"" + escape(result) + "\"}");
-            store.appendEvent(threadId, "turn.completed",
-                    "{\"turn_id\":\"" + turnId + "\",\"status\":\"completed\"}");
+            try (CancellationContext.Scope ignored = CancellationContext.bind(token)) {
+                String result = runner.run(input);
+                if (token.isCancelled()) {
+                    boolean timedOut = token.isDeadlineExceeded();
+                    PaiCliTracing.TraceReference traceReference = takeTraceReference();
+                    store.appendEvent(threadId, "turn.failed",
+                            "{\"turn_id\":\"" + turnId + "\",\"status\":\""
+                                    + (timedOut ? "timeout" : "canceled") + "\","
+                                    + "\"error\":\"" + (timedOut
+                                    ? "Agent 全链路 Deadline 已耗尽" : "Agent 运行已取消") + "\""
+                                    + traceFields(traceReference) + "}");
+                    return;
+                }
+                store.appendEvent(threadId, "message.delta",
+                        "{\"turn_id\":\"" + turnId + "\",\"content\":\"" + escape(result) + "\"}");
+                PaiCliTracing.TraceReference traceReference = takeTraceReference();
+                store.appendEvent(threadId, "turn.completed",
+                        "{\"turn_id\":\"" + turnId + "\",\"status\":\"completed\""
+                                + traceFields(traceReference) + "}");
+            }
         } catch (Exception e) {
+            PaiCliTracing.TraceReference traceReference = takeTraceReference();
+            String status = token.isDeadlineExceeded()
+                    ? "timeout"
+                    : token.isCancelled() ? "canceled" : "failed";
             store.appendEvent(threadId, "turn.failed",
-                    "{\"turn_id\":\"" + turnId + "\",\"error\":\"" + escape(e.getMessage()) + "\"}");
+                    "{\"turn_id\":\"" + turnId + "\",\"status\":\"" + status
+                            + "\",\"error\":\"" + escape(e.getMessage()) + "\""
+                            + traceFields(traceReference) + "}");
+        } finally {
+            runningTurns.remove(turnId, token);
+            CancellationContext.clear(token);
+            if (Thread.currentThread().isInterrupted()) {
+                Thread.interrupted();
+            }
         }
     }
 
@@ -125,6 +187,23 @@ public class RuntimeApiServer implements AutoCloseable {
         try (OutputStream os = exchange.getResponseBody()) {
             os.write(body);
         }
+    }
+
+    private PaiCliTracing.TraceReference takeTraceReference() {
+        try {
+            Optional<PaiCliTracing.TraceReference> reference = traceReferenceSupplier.get();
+            return reference == null ? null : reference.orElse(null);
+        } catch (RuntimeException ignored) {
+            return null;
+        }
+    }
+
+    private static String traceFields(PaiCliTracing.TraceReference reference) {
+        if (reference == null) {
+            return "";
+        }
+        return ",\"trace_id\":\"" + escape(reference.traceId())
+                + "\",\"root_observation_id\":\"" + escape(reference.observationId()) + "\"";
     }
 
     private boolean authorized(HttpExchange exchange) {
@@ -186,6 +265,7 @@ public class RuntimeApiServer implements AutoCloseable {
     @Override
     public void close() {
         server.stop(0);
+        runningTurns.values().forEach(CancellationToken::cancel);
         executor.shutdownNow();
     }
 }

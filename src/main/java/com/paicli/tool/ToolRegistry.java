@@ -12,6 +12,7 @@ import com.paicli.context.ContextProfile;
 import com.paicli.lsp.LspDiagnosticReport;
 import com.paicli.lsp.LspManager;
 import com.paicli.mcp.protocol.McpToolDescriptor;
+import com.paicli.observability.PaiCliTracing;
 import com.paicli.rag.CodeRetriever;
 import com.paicli.rag.SearchResultFormatter;
 import com.paicli.rag.VectorStore;
@@ -20,6 +21,7 @@ import com.paicli.policy.CommandGuard;
 import com.paicli.policy.PathGuard;
 import com.paicli.policy.PolicyException;
 import com.paicli.runtime.CancellationContext;
+import com.paicli.runtime.CancellationToken;
 import com.paicli.snapshot.RestoreResult;
 import com.paicli.snapshot.SnapshotService;
 import com.paicli.skill.Skill;
@@ -46,6 +48,7 @@ import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.*;
 import java.util.concurrent.*;
+import io.opentelemetry.context.Context;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -104,20 +107,41 @@ public class ToolRegistry {
     private boolean customSnapshotService;
     private volatile String currentProvider = "";
     private volatile String currentModel = "";
+    private PaiCliTracing tracing = PaiCliTracing.noop();
+    private final ToolResultArtifactStore toolResultArtifactStore;
+    private final boolean artifactStoreOwner;
 
     public ToolRegistry() {
-        this(DEFAULT_COMMAND_TIMEOUT_SECONDS, DEFAULT_TOOL_BATCH_TIMEOUT_SECONDS);
+        this(DEFAULT_COMMAND_TIMEOUT_SECONDS, DEFAULT_TOOL_BATCH_TIMEOUT_SECONDS, null, true);
+    }
+
+    public ToolRegistry(ToolResultArtifactStore toolResultArtifactStore) {
+        this(DEFAULT_COMMAND_TIMEOUT_SECONDS, DEFAULT_TOOL_BATCH_TIMEOUT_SECONDS,
+                Objects.requireNonNull(toolResultArtifactStore, "toolResultArtifactStore"), true);
     }
 
     ToolRegistry(long commandTimeoutSeconds) {
-        this(commandTimeoutSeconds, Math.max(commandTimeoutSeconds + 5, DEFAULT_TOOL_BATCH_TIMEOUT_SECONDS));
+        this(commandTimeoutSeconds,
+                Math.max(commandTimeoutSeconds + 5, DEFAULT_TOOL_BATCH_TIMEOUT_SECONDS),
+                null,
+                true);
     }
 
     ToolRegistry(long commandTimeoutSeconds, long toolBatchTimeoutSeconds) {
+        this(commandTimeoutSeconds, toolBatchTimeoutSeconds, null, true);
+    }
+
+    ToolRegistry(long commandTimeoutSeconds, long toolBatchTimeoutSeconds,
+                 ToolResultArtifactStore toolResultArtifactStore, boolean artifactStoreOwner) {
         this.commandTimeoutSeconds = commandTimeoutSeconds;
         this.toolBatchTimeoutSeconds = toolBatchTimeoutSeconds;
+        this.toolResultArtifactStore = toolResultArtifactStore == null
+                ? ToolResultArtifactStore.createDefault(Path.of(projectPath))
+                : toolResultArtifactStore;
+        this.artifactStoreOwner = toolResultArtifactStore == null || artifactStoreOwner;
         // 注册内置工具
         registerFileTools();
+        registerContextTools();
         registerShellTools();
         registerCodeTools();
         registerRagTools();
@@ -139,6 +163,9 @@ public class ToolRegistry {
             this.snapshotService.close();
             this.snapshotService = SnapshotService.forProject(Path.of(projectPath));
         }
+        if (artifactStoreOwner) {
+            this.toolResultArtifactStore.rebindProject(Path.of(projectPath));
+        }
     }
 
     /**
@@ -158,9 +185,46 @@ public class ToolRegistry {
         return contextProfile;
     }
 
+    public String getToolResultManifestHandle() {
+        return toolResultArtifactStore.manifestHandle();
+    }
+
+    public int getToolResultArtifactCount() {
+        return toolResultArtifactStore.artifactCount();
+    }
+
+    public long getToolResultArtifactBytes() {
+        return toolResultArtifactStore.sessionBytes();
+    }
+
+    /** Bounded metadata for deterministic artifact recovery hints in projected model history. */
+    public ToolResultArtifactIndex getToolResultArtifactIndex() {
+        return toolResultArtifactStore.artifactIndexSnapshot(5);
+    }
+
+    /** Explicitly named alias for diagnostics and tests. */
+    public ToolResultArtifactIndex getToolResultArtifactIndexSnapshot() {
+        return getToolResultArtifactIndex();
+    }
+
+    /** Rotates the owning CLI/runtime artifact scope. Shared Explore views never clear it. */
+    public void clearToolResultArtifacts() {
+        if (artifactStoreOwner) {
+            toolResultArtifactStore.clearSession();
+        }
+    }
+
+    ToolResultArtifactStore getToolResultArtifactStore() {
+        return toolResultArtifactStore;
+    }
+
+    public void setTracing(PaiCliTracing tracing) {
+        this.tracing = tracing == null ? PaiCliTracing.noop() : tracing;
+    }
+
     /**
      * 构造给只读检索子 Agent 用的工具视图：物理排除写 / 执行 / 项目 / 回滚工具与
-     * {@code explore_codebase} 自身，只暴露 5 个只读检索工具。
+     * {@code explore_codebase} 自身，只暴露 5 个只读检索工具和 {@code read_tool_result}。
      *
      * <p>采用“播种式拷贝”而非 {@code new ToolRegistry() + retainAll}：每个工具 handler 是构造时
      * 注册的 lambda,闭包捕获的是「该实例自己的字段」。{@code new ToolRegistry()} 会把 {@code projectPath}
@@ -169,7 +233,11 @@ public class ToolRegistry {
      * <p>白名单只含只读工具 → 子 Agent 不可能触发 HITL,也不含 {@code explore_codebase} → 杜绝递归嵌套。
      */
     public ToolRegistry readOnlyExploreView() {
-        ToolRegistry view = new ToolRegistry();
+        ToolRegistry view = new ToolRegistry(
+                DEFAULT_COMMAND_TIMEOUT_SECONDS,
+                DEFAULT_TOOL_BATCH_TIMEOUT_SECONDS,
+                this.toolResultArtifactStore,
+                false);
 
         // —— 快照能力：丢弃（只读视图用不到）——
         // 必须避免 setProjectPath 在 !customSnapshotService 时对同一工程 close+forProject 重建,
@@ -185,13 +253,15 @@ public class ToolRegistry {
         view.setProjectPath(this.projectPath);        // 级联重建 pathGuard / lspManager；因上面置真,跳过快照重建
         view.setContextProfile(this.contextProfile);  // 压缩触发阈值与主 Agent 一致
 
+        view.setTracing(this.tracing);
         // —— 故意不复制 searchProvider ——
-        // 白名单 5 个工具均不依赖它：search_code 走 new CodeRetriever(projectPath);
+        // 五个检索工具均不依赖它：search_code 走 new CodeRetriever(projectPath)；
+        // read_tool_result 只读取上面共享的 session artifact store。
         // searchProvider 只支撑未在白名单内的 web_search,复制属冗余。
 
         // —— 裁剪：只保留只读检索工具 ——
         view.tools.keySet().retainAll(Set.of(
-                "glob_files", "grep_code", "read_file", "list_dir", "search_code"));
+                "glob_files", "grep_code", "read_file", "list_dir", "search_code", "read_tool_result"));
         return view;
     }
 
@@ -568,6 +638,22 @@ public class ToolRegistry {
     /**
      * 注册Shell命令工具
      */
+    private void registerContextTools() {
+        tools.put("read_tool_result", new Tool(
+                "read_tool_result",
+                "按 opaque handle 分片读取已落盘的大工具结果；offset/max_chars 按 Unicode code point 计数，单次最多 24000 字符",
+                createParameters(
+                        new Param("handle", "string", "tool-result://<session-id>/<artifact-id> 形式的句柄", true),
+                        new Param("offset", "integer", "起始 Unicode code point offset，默认 0", false),
+                        new Param("max_chars", "integer", "本次最多读取的 Unicode code points，默认 12000，上限 24000", false)
+                ),
+                args -> toolResultArtifactStore.read(
+                        args.get("handle"),
+                        parseInt(args.get("offset"), 0),
+                        parseInt(args.get("max_chars"), ToolResultArtifactStore.DEFAULT_READ_CODE_POINTS))
+        ));
+    }
+
     private void registerShellTools() {
         tools.put("execute_command", new Tool(
                 "execute_command",
@@ -746,8 +832,8 @@ public class ToolRegistry {
                     int originalLen = body == null ? 0 : body.length();
                     int max = 5 * 1024;
                     String injected = body == null ? "" : body;
-                    if (injected.length() > max) {
-                        injected = injected.substring(0, max)
+                    if (injected.codePointCount(0, injected.length()) > max) {
+                        injected = ToolResultMetadata.truncateCodePoints(injected, max)
                                 + "\n\n...(skill body truncated, full content via /skill show " + name + ")";
                     }
                     if (skillContextBuffer != null) {
@@ -992,8 +1078,8 @@ public class ToolRegistry {
             String markdown = extracted.markdown();
             int originalLength = markdown.length();
             boolean truncated = false;
-            if (maxChars > 0 && markdown.length() > maxChars) {
-                markdown = markdown.substring(0, maxChars);
+            if (maxChars > 0 && markdown.codePointCount(0, markdown.length()) > maxChars) {
+                markdown = ToolResultMetadata.truncateCodePoints(markdown, maxChars);
                 truncated = true;
             }
             FetchResult result = FetchResult.ok(raw.url(), extracted.title(), markdown, originalLength, truncated);
@@ -1249,19 +1335,29 @@ public class ToolRegistry {
      * 如果某个工具超过批次超时仍未返回，会取消任务并返回超时结果；已完成工具不受影响。
      */
     public List<ToolExecutionResult> executeTools(List<ToolInvocation> invocations) {
+        try (ToolResultArtifactStore.SessionLease ignored =
+                     toolResultArtifactStore.acquireSessionLease()) {
+            return executeToolsInArtifactSession(invocations);
+        }
+    }
+
+    private List<ToolExecutionResult> executeToolsInArtifactSession(List<ToolInvocation> invocations) {
         if (invocations == null || invocations.isEmpty()) {
             return List.of();
         }
         if (CancellationContext.isCancelled()) {
+            String stopMessage = CancellationContext.stopMessage("本轮工具调用");
             return invocations.stream()
-                    .map(invocation -> ToolExecutionResult.failed(invocation, "用户取消了此次工具调用"))
+                    .map(invocation -> ToolExecutionResult.failed(invocation, stopMessage))
                     .toList();
         }
-        if (invocations.size() == 1) {
-            ToolInvocation invocation = invocations.get(0);
-            long startedAt = System.nanoTime();
-            ToolOutput output = executeToolOutput(invocation.name(), invocation.argumentsJson());
-            return List.of(ToolExecutionResult.completed(invocation, output, elapsedMillis(startedAt)));
+
+        long batchTimeoutMillis = CancellationContext.remainingMillis(
+                TimeUnit.SECONDS.toMillis(toolBatchTimeoutSeconds), 0);
+        if (batchTimeoutMillis <= 0) {
+            return invocations.stream()
+                    .map(invocation -> ToolExecutionResult.timedOut(invocation, 0))
+                    .toList();
         }
 
         int parallelism = Math.min(invocations.size(), MAX_PARALLEL_TOOLS);
@@ -1270,28 +1366,34 @@ public class ToolRegistry {
             thread.setDaemon(true);
             return thread;
         });
+        List<CancellationToken> toolTokens = new ArrayList<>(invocations.size());
+        for (int i = 0; i < invocations.size(); i++) {
+            toolTokens.add(CancellationContext.childToken(batchTimeoutMillis));
+        }
 
         try {
-            List<Callable<ToolExecutionResult>> tasks = invocations.stream()
-                    .<Callable<ToolExecutionResult>>map(invocation -> () -> {
-                        if (CancellationContext.isCancelled()) {
-                            return ToolExecutionResult.failed(invocation, "用户取消了此次工具调用");
-                        }
-                        long startedAt = System.nanoTime();
-                        ToolOutput output = executeToolOutput(invocation.name(), invocation.argumentsJson());
-                        return ToolExecutionResult.completed(invocation, output, elapsedMillis(startedAt));
-                    })
-                    .toList();
+            Context parentContext = Context.current();
+            List<Callable<ToolExecutionResult>> tasks = new ArrayList<>(invocations.size());
+            for (int i = 0; i < invocations.size(); i++) {
+                ToolInvocation invocation = invocations.get(i);
+                CancellationToken toolToken = toolTokens.get(i);
+                tasks.add(parentContext.wrap(() -> {
+                    try (CancellationContext.Scope ignored = CancellationContext.bind(toolToken)) {
+                        return executeTracedInvocation(invocation);
+                    }
+                }));
+            }
 
             List<Future<ToolExecutionResult>> futures =
-                    executor.invokeAll(tasks, toolBatchTimeoutSeconds, TimeUnit.SECONDS);
+                    executor.invokeAll(tasks, batchTimeoutMillis, TimeUnit.MILLISECONDS);
 
             List<ToolExecutionResult> results = new ArrayList<>();
             for (int i = 0; i < futures.size(); i++) {
                 ToolInvocation invocation = invocations.get(i);
                 Future<ToolExecutionResult> future = futures.get(i);
                 if (future.isCancelled()) {
-                    results.add(ToolExecutionResult.timedOut(invocation, toolBatchTimeoutSeconds));
+                    toolTokens.get(i).timeout();
+                    results.add(ToolExecutionResult.timedOut(invocation, batchTimeoutMillis));
                     continue;
                 }
 
@@ -1311,11 +1413,47 @@ public class ToolRegistry {
             return results;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            toolTokens.forEach(CancellationToken::cancel);
             return invocations.stream()
                     .map(invocation -> ToolExecutionResult.failed(invocation, "工具批次执行被中断"))
                     .toList();
         } finally {
             executor.shutdownNow();
+            toolTokens.forEach(CancellationToken::close);
+        }
+    }
+
+    private ToolExecutionResult executeTracedInvocation(ToolInvocation invocation) {
+        try (PaiCliTracing.ToolRun toolRun = tracing.startTool(
+                invocation.name(), invocation.id(), invocation.argumentsJson())) {
+            // catch 必须写在 try-with-resources 内部：写在外层时 span 已经 close，
+            // toolRun.error(...) 永远调不到，异常在 Trace 里会伪装成正常结束。
+            try {
+                if (CancellationContext.isCancelled()) {
+                    ToolExecutionResult failed = ToolExecutionResult.failed(invocation, "用户取消了此次工具调用");
+                    toolRun.output(failed.result());
+                    toolRun.cancelled("用户取消了此次工具调用");
+                    return failed;
+                }
+                long startedAt = System.nanoTime();
+                ToolOutput output = executeToolOutput(invocation.name(), invocation.argumentsJson());
+                String rawText = output == null ? "" : output.text();
+                ToolResultProjection projection = toolResultArtifactStore.project(
+                        invocation.name(),
+                        invocation.id(),
+                        rawText,
+                        "read_tool_result".equals(invocation.name()));
+                ToolExecutionResult result = ToolExecutionResult.completed(
+                        invocation, output, projection, elapsedMillis(startedAt));
+                toolRun.output(result.observabilitySummary());
+                return result;
+            } catch (RuntimeException e) {
+                ToolExecutionResult failed = ToolExecutionResult.failed(invocation,
+                        e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+                toolRun.output(failed.result());
+                toolRun.error(e);
+                return failed;
+            }
         }
     }
 
@@ -1364,19 +1502,35 @@ public class ToolRegistry {
             process = pb.start();
 
             Process runningProcess = process;
-            Future<String> outputFuture = outputReaderExecutor.submit(() -> readProcessOutput(runningProcess));
+            CancellationToken token = CancellationContext.current();
+            CancellationToken.Registration cancellationRegistration = token == null
+                    ? CancellationToken.Registration.NO_OP
+                    : token.onCancel(runningProcess::destroyForcibly);
+            try (cancellationRegistration) {
+                Future<String> outputFuture = outputReaderExecutor.submit(
+                        CancellationContext.wrap((Callable<String>)
+                                () -> readProcessOutput(runningProcess)));
+                long commandTimeoutMillis = CancellationContext.remainingMillis(
+                        TimeUnit.SECONDS.toMillis(commandTimeoutSeconds), 0);
+                if (commandTimeoutMillis <= 0) {
+                    runningProcess.destroyForcibly();
+                    outputFuture.cancel(true);
+                    return CancellationContext.stopMessage("命令执行");
+                }
 
-            boolean finished = process.waitFor(commandTimeoutSeconds, TimeUnit.SECONDS);
-            if (!finished) {
-                process.destroyForcibly();
-                process.waitFor(2, TimeUnit.SECONDS);
-                outputFuture.cancel(true);
-                return "命令执行超时（" + commandTimeoutSeconds + "秒），已强制终止";
+                boolean finished = process.waitFor(commandTimeoutMillis, TimeUnit.MILLISECONDS);
+                if (!finished) {
+                    process.destroyForcibly();
+                    process.waitFor(2, TimeUnit.SECONDS);
+                    outputFuture.cancel(true);
+                    return "命令执行超时（" + Math.max(1, TimeUnit.MILLISECONDS.toSeconds(commandTimeoutMillis))
+                            + "秒），已强制终止";
+                }
+
+                String output = getCommandOutput(outputFuture);
+                int exitCode = process.exitValue();
+                return String.format("命令执行完成 (exit code: %d)\n%s", exitCode, output);
             }
-
-            String output = getCommandOutput(outputFuture);
-            int exitCode = process.exitValue();
-            return String.format("命令执行完成 (exit code: %d)\n%s", exitCode, output);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             if (process != null) {
@@ -1395,22 +1549,35 @@ public class ToolRegistry {
 
     private String readProcessOutput(Process process) throws Exception {
         StringBuilder output = new StringBuilder();
+        int outputCodePoints = 0;
+        boolean truncated = false;
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
             String line;
             while ((line = reader.readLine()) != null) {
-                if (output.length() < MAX_COMMAND_OUTPUT_CHARS) {
-                    int remaining = MAX_COMMAND_OUTPUT_CHARS - output.length();
-                    if (line.length() > remaining) {
-                        output.append(line, 0, remaining);
-                    } else {
-                        output.append(line);
-                    }
-                    output.append("\n");
+                int remaining = MAX_COMMAND_OUTPUT_CHARS - outputCodePoints;
+                if (remaining <= 0) {
+                    truncated = true;
+                    continue;
+                }
+                int lineCodePoints = line.codePointCount(0, line.length());
+                if (lineCodePoints > remaining) {
+                    output.append(ToolResultMetadata.truncateCodePoints(line, remaining));
+                    outputCodePoints += remaining;
+                    truncated = true;
+                    continue;
+                }
+                output.append(line);
+                outputCodePoints += lineCodePoints;
+                if (outputCodePoints < MAX_COMMAND_OUTPUT_CHARS) {
+                    output.append('\n');
+                    outputCodePoints++;
+                } else {
+                    truncated = true;
                 }
             }
         }
-        if (output.length() >= MAX_COMMAND_OUTPUT_CHARS) {
-            return output.substring(0, MAX_COMMAND_OUTPUT_CHARS) + "\n...(输出已截断)";
+        if (truncated) {
+            return output + "\n...(输出已截断)";
         }
         return output.toString();
     }
@@ -1435,33 +1602,68 @@ public class ToolRegistry {
 
     public record ToolExecutionResult(String id, String name, String argumentsJson,
                                       String result, long elapsedMillis, boolean timedOut,
-                                      List<com.paicli.llm.LlmClient.ContentPart> imageParts) {
-        private static ToolExecutionResult completed(ToolInvocation invocation, ToolOutput output, long elapsedMillis) {
+                                      List<com.paicli.llm.LlmClient.ContentPart> imageParts,
+                                      String displayPreview,
+                                      ToolResultMetadata resultMetadata,
+                                      ToolResultArtifactRef artifactRef,
+                                      boolean artifactWriteFailed) {
+        public ToolExecutionResult {
+            result = result == null ? "" : result;
+            imageParts = imageParts == null ? List.of() : List.copyOf(imageParts);
+            displayPreview = displayPreview == null ? result : displayPreview;
+            resultMetadata = resultMetadata == null
+                    ? ToolResultMetadata.from(name, displayPreview)
+                    : resultMetadata;
+        }
+
+        /** Source-compatible constructor for existing extensions and tests. */
+        public ToolExecutionResult(String id, String name, String argumentsJson,
+                                   String result, long elapsedMillis, boolean timedOut,
+                                   List<com.paicli.llm.LlmClient.ContentPart> imageParts) {
+            this(id, name, argumentsJson, result, elapsedMillis, timedOut, imageParts,
+                    result,
+                    ToolResultMetadata.from(name, result),
+                    null,
+                    false);
+        }
+
+        private static ToolExecutionResult completed(ToolInvocation invocation, ToolOutput output,
+                                                     ToolResultProjection projection, long elapsedMillis) {
             return new ToolExecutionResult(
                     invocation.id(),
                     invocation.name(),
                     invocation.argumentsJson(),
-                    output == null ? "" : output.text(),
+                    projection == null ? "" : projection.contextText(),
                     elapsedMillis,
                     false,
-                    output == null ? List.of() : output.imageParts());
+                    output == null ? List.of() : output.imageParts(),
+                    projection == null ? "" : projection.displayPreview(),
+                    projection == null ? null : projection.resultMetadata(),
+                    projection == null ? null : projection.artifactRef(),
+                    projection != null && projection.artifactWriteFailed());
         }
 
         private static ToolExecutionResult completed(ToolInvocation invocation, String result, long elapsedMillis) {
-            return completed(invocation, ToolOutput.text(result), elapsedMillis);
+            return new ToolExecutionResult(
+                    invocation.id(), invocation.name(), invocation.argumentsJson(), result,
+                    elapsedMillis, false, List.of());
         }
 
         private static ToolExecutionResult failed(ToolInvocation invocation, String message) {
-            return completed(invocation, "工具执行失败: " + message, 0);
+            String boundedMessage = ToolResultMetadata.truncateCodePoints(
+                    message == null ? "未知错误" : message,
+                    4_000);
+            return completed(invocation, "工具执行失败: " + boundedMessage, 0);
         }
 
-        private static ToolExecutionResult timedOut(ToolInvocation invocation, long timeoutSeconds) {
+        private static ToolExecutionResult timedOut(ToolInvocation invocation, long timeoutMillis) {
+            long displaySeconds = Math.max(1, TimeUnit.MILLISECONDS.toSeconds(timeoutMillis));
             return new ToolExecutionResult(
                     invocation.id(),
                     invocation.name(),
                     invocation.argumentsJson(),
-                    "工具执行超时（" + timeoutSeconds + "秒），已取消",
-                    timeoutSeconds * 1000,
+                    "工具执行超时（" + displaySeconds + "秒），已取消",
+                    Math.max(0, timeoutMillis),
                     true,
                     List.of()
             );
@@ -1469,6 +1671,32 @@ public class ToolRegistry {
 
         public boolean hasImageParts() {
             return imageParts != null && !imageParts.isEmpty();
+        }
+
+        public boolean spilled() {
+            return artifactRef != null;
+        }
+
+        public boolean partial() {
+            return resultMetadata != null && resultMetadata.partial();
+        }
+
+        /** Bounded trace/log representation that never records a spilled artifact preview. */
+        public String observabilitySummary() {
+            if (artifactRef != null) {
+                return "artifact_handle=" + artifactRef.handle()
+                        + ", chars=" + artifactRef.chars()
+                        + ", sha256=" + artifactRef.sha256()
+                        + ", captured_complete=" + artifactRef.capturedComplete()
+                        + ", partial=" + partial();
+            }
+            if (artifactWriteFailed) {
+                String firstLine = result == null ? "artifact_write_failed" : result.lines()
+                        .findFirst().orElse("artifact_write_failed");
+                return ToolResultMetadata.truncateCodePoints(firstLine, 500)
+                        + ", artifact_write_failed=true";
+            }
+            return displayPreview;
         }
     }
 

@@ -2,12 +2,16 @@ package com.paicli.plan;
 
 import com.paicli.llm.GLMClient;
 import com.paicli.llm.LlmClient;
+import com.paicli.context.ContextViewBuildException;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.io.OutputStream;
+import java.io.PrintStream;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class PlannerTest {
@@ -54,6 +58,20 @@ class PlannerTest {
         assertTrue(plan.getTask("task_2").getDependencies().contains("task_1"));
     }
 
+    @Test
+    void blocksOversizedComplexGoalBeforePlannerClientIsCalled() {
+        TinyPlannerClient client = new TinyPlannerClient();
+        Planner planner = new Planner(
+                client, new PrintStream(OutputStream.nullOutputStream()));
+
+        ContextViewBuildException error = assertThrows(
+                ContextViewBuildException.class,
+                () -> planner.createPlan("分析项目并制定多步骤方案 " + "x".repeat(30_000)));
+
+        assertTrue(error.getMessage().startsWith(ContextViewBuildException.CODE));
+        assertEquals(0, client.calls);
+    }
+
     private static final class FailingGLMClient extends GLMClient {
         private FailingGLMClient() {
             super("test-key");
@@ -76,6 +94,38 @@ class PlannerTest {
         @Override
         public ChatResponse chat(List<Message> messages, List<Tool> tools, StreamListener listener) {
             return new ChatResponse("assistant", content, null, 100, 20);
+        }
+    }
+
+    private static final class TinyPlannerClient implements LlmClient {
+        private int calls;
+
+        @Override
+        public ChatResponse chat(List<Message> messages, List<Tool> tools) {
+            calls++;
+            return new ChatResponse("assistant", "{}", null, 1, 1);
+        }
+
+        @Override
+        public ChatResponse chat(List<Message> messages, List<Tool> tools,
+                                 StreamListener listener) {
+            calls++;
+            return new ChatResponse("assistant", "{}", null, 1, 1);
+        }
+
+        @Override
+        public String getModelName() {
+            return "tiny-planner";
+        }
+
+        @Override
+        public String getProviderName() {
+            return "test";
+        }
+
+        @Override
+        public int maxContextWindow() {
+            return 8_000;
         }
     }
 }

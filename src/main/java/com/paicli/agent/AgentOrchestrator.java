@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.paicli.llm.LlmClient;
 import com.paicli.memory.MemoryManager;
 import com.paicli.runtime.CancellationContext;
+import com.paicli.runtime.CancellationToken;
+import com.paicli.runtime.ResilienceConfig;
 import com.paicli.tool.ToolRegistry;
 import com.paicli.util.AnsiStyle;
 import org.slf4j.Logger;
@@ -78,6 +80,9 @@ public class AgentOrchestrator {
         PENDING, RUNNING, COMPLETED, FAILED
     }
 
+    private record PendingStep(ExecutionStep step, CancellationToken token, Future<?> future) {
+    }
+
     public AgentOrchestrator(LlmClient llmClient) {
         this(llmClient, new ToolRegistry(), new MemoryManager(llmClient));
     }
@@ -136,10 +141,16 @@ public class AgentOrchestrator {
      * 运行多 Agent 协作任务
      */
     public String run(String userInput) {
+        try (CancellationContext.RunLease ignored = CancellationContext.openRun()) {
+            return runWithinContext(userInput);
+        }
+    }
+
+    private String runWithinContext(String userInput) {
         log.info("Multi-Agent run started: inputLength={}", userInput == null ? 0 : userInput.length());
         memoryManager.addUserMessage(userInput);
         if (CancellationContext.isCancelled()) {
-            return "⏹️ 已取消当前多 Agent 任务。";
+            return CancellationContext.stopMessage("当前多 Agent 任务");
         }
 
         // 1. 规划阶段：让规划者拆解任务
@@ -151,7 +162,7 @@ public class AgentOrchestrator {
         AgentMessage planResult = planner.execute(planMessage, out);
         planner.clearHistory();
         if (CancellationContext.isCancelled()) {
-            return "⏹️ 已取消当前多 Agent 任务。";
+            return CancellationContext.stopMessage("当前多 Agent 任务");
         }
 
         if (planResult.type() == AgentMessage.Type.ERROR) {
@@ -178,7 +189,7 @@ public class AgentOrchestrator {
 
         while (true) {
             if (CancellationContext.isCancelled()) {
-                return "⏹️ 已取消当前多 Agent 任务。";
+                return CancellationContext.stopMessage("当前多 Agent 任务");
             }
             List<ExecutionStep> executable = getExecutableSteps(steps);
             if (executable.isEmpty()) {
@@ -192,7 +203,9 @@ public class AgentOrchestrator {
                 SubAgent worker = workers.get(singleStepCursor % workers.size());
                 singleStepCursor++;
                 String context = buildStepContext(steps, step);
-                runStep(step, steps, retryCount, worker, reviewer, context, out);
+                CancellationToken stepToken = CancellationContext.childToken(
+                        ResilienceConfig.current().stepDeadlineMillis());
+                runStepWithinDeadline(step, steps, retryCount, worker, reviewer, context, out, stepToken);
                 worker.clearHistory();
             } else {
                 // 多步批次：真正并行执行，每步用独立的 PrintStream 缓冲，完成后按 step_id 顺序 flush
@@ -401,6 +414,15 @@ public class AgentOrchestrator {
         }
     }
 
+    private synchronized StepStatus currentStepStatus(List<ExecutionStep> steps, String stepId) {
+        for (ExecutionStep step : steps) {
+            if (step.id().equals(stepId)) {
+                return step.status();
+            }
+        }
+        return StepStatus.FAILED;
+    }
+
     /**
      * 并行执行一批相互独立的步骤。
      *
@@ -417,7 +439,8 @@ public class AgentOrchestrator {
         });
         BlockingQueue<SubAgent> workerPool = new LinkedBlockingQueue<>(workers);
         Map<String, ByteArrayOutputStream> buffers = new ConcurrentHashMap<>();
-        List<Future<?>> futures = new ArrayList<>();
+        List<PendingStep> pendingSteps = new ArrayList<>();
+        long stepDeadlineMillis = ResilienceConfig.current().stepDeadlineMillis();
 
         for (ExecutionStep step : batch) {
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
@@ -425,13 +448,15 @@ public class AgentOrchestrator {
             PrintStream stepOut = new PrintStream(baos, true, StandardCharsets.UTF_8);
             String context = buildStepContext(steps, step);
 
-            futures.add(executor.submit(() -> {
+            CancellationToken stepToken = CancellationContext.childToken(stepDeadlineMillis);
+            Future<?> future = executor.submit(() -> {
                 SubAgent worker = null;
                 SubAgent localReviewer = new SubAgent(
                         "reviewer-" + step.id(), AgentRole.REVIEWER, llmClient, toolRegistry);
                 try {
                     worker = workerPool.take();
-                    runStep(step, steps, retryCount, worker, localReviewer, context, stepOut);
+                    runStepWithinDeadline(step, steps, retryCount, worker, localReviewer,
+                            context, stepOut, stepToken);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     updateStep(steps, step.id(), step.withFailed("并行执行被中断"));
@@ -448,13 +473,35 @@ public class AgentOrchestrator {
                     stepOut.flush();
                 }
                 return null;
-            }));
+            });
+            pendingSteps.add(new PendingStep(step, stepToken, future));
         }
 
-        for (Future<?> f : futures) {
+        for (PendingStep pending : pendingSteps) {
+            if (CancellationContext.isCancelled()) {
+                cancelPendingSteps(pendingSteps, steps, CancellationContext.isDeadlineExceeded());
+            }
+            if (pending.token().isCancelled()) {
+                pending.future().cancel(true);
+                String reason = pending.token().isDeadlineExceeded() ? "步骤超过 Deadline" : "步骤已取消";
+                if (currentStepStatus(steps, pending.step().id()) != StepStatus.COMPLETED) {
+                    updateStep(steps, pending.step().id(), pending.step().withFailed(reason));
+                }
+                continue;
+            }
             try {
-                f.get();
+                long waitMillis = Math.min(
+                        CancellationContext.remainingMillis(stepDeadlineMillis, 0),
+                        pending.token().remainingMillis());
+                if (waitMillis <= 0) {
+                    throw new TimeoutException("Team step Deadline exhausted");
+                }
+                pending.future().get(waitMillis, TimeUnit.MILLISECONDS);
+            } catch (TimeoutException e) {
+                cancelPendingSteps(pendingSteps, steps, true);
+                log.warn("Parallel step {} timed out", pending.step().id());
             } catch (InterruptedException e) {
+                cancelPendingSteps(pendingSteps, steps, CancellationContext.isDeadlineExceeded());
                 Thread.currentThread().interrupt();
                 log.warn("Batch wait interrupted");
             } catch (ExecutionException e) {
@@ -473,6 +520,40 @@ public class AgentOrchestrator {
         }
     }
 
+    private void cancelPendingSteps(List<PendingStep> pendingSteps, List<ExecutionStep> steps,
+                                    boolean timedOut) {
+        String reason = timedOut ? "步骤超过 Deadline" : "步骤已取消";
+        for (PendingStep pending : pendingSteps) {
+            if (pending.future().isDone()) {
+                continue;
+            }
+            if (timedOut) {
+                pending.token().timeout();
+            } else {
+                pending.token().cancel();
+            }
+            pending.future().cancel(true);
+            if (currentStepStatus(steps, pending.step().id()) != StepStatus.COMPLETED) {
+                updateStep(steps, pending.step().id(), pending.step().withFailed(reason));
+            }
+        }
+    }
+
+    private void runStepWithinDeadline(ExecutionStep step, List<ExecutionStep> steps,
+                                       Map<String, Integer> retryCount,
+                                       SubAgent worker, SubAgent reviewer, String context,
+                                       PrintStream out, CancellationToken token) {
+        try (token; CancellationContext.Scope ignored = CancellationContext.bind(token)) {
+            runStep(step, steps, retryCount, worker, reviewer, context, out);
+            if (token.isDeadlineExceeded() && currentStepStatus(steps, step.id()) != StepStatus.FAILED) {
+                updateStep(steps, step.id(), step.withFailed("步骤超过 Deadline"));
+                out.println("⏱️ 步骤 [" + step.id() + "] 超过 Deadline\n");
+            } else if (token.isCancelled() && currentStepStatus(steps, step.id()) != StepStatus.FAILED) {
+                updateStep(steps, step.id(), step.withFailed("步骤已取消"));
+            }
+        }
+    }
+
     /**
      * 执行单个步骤（Worker 执行 + Reviewer 审查 + 最多 2 次重试）。
      *
@@ -484,16 +565,18 @@ public class AgentOrchestrator {
                          PrintStream out) {
         out.println("🛠️ " + worker.getName() + " 执行步骤 [" + step.id() + "]: " + step.description());
         if (CancellationContext.isCancelled()) {
-            updateStep(steps, step.id(), step.withFailed("用户取消"));
-            out.println("⏹️ 步骤 [" + step.id() + "] 已取消\n");
+            String reason = CancellationContext.isDeadlineExceeded() ? "步骤超过 Deadline" : "用户取消";
+            updateStep(steps, step.id(), step.withFailed(reason));
+            out.println(CancellationContext.stopMessage("步骤 [" + step.id() + "]") + "\n");
             return;
         }
 
         AgentMessage taskMsg = AgentMessage.task("orchestrator", step.description());
         AgentMessage result = worker.executeWithContext(taskMsg, context, out);
         if (CancellationContext.isCancelled()) {
-            updateStep(steps, step.id(), step.withFailed("用户取消"));
-            out.println("⏹️ 步骤 [" + step.id() + "] 已取消\n");
+            String reason = CancellationContext.isDeadlineExceeded() ? "步骤超过 Deadline" : "用户取消";
+            updateStep(steps, step.id(), step.withFailed(reason));
+            out.println(CancellationContext.stopMessage("步骤 [" + step.id() + "]") + "\n");
             return;
         }
 
@@ -533,6 +616,12 @@ public class AgentOrchestrator {
         log.info("Step {} rejected (retry {}/{}): {}", step.id(), retries, MAX_RETRIES_PER_STEP, issues);
 
         while (!approved && retries < MAX_RETRIES_PER_STEP) {
+            if (CancellationContext.isCancelled()) {
+                String reason = CancellationContext.isDeadlineExceeded() ? "步骤超过 Deadline" : "用户取消";
+                updateStep(steps, step.id(), step.withFailed(reason));
+                out.println(CancellationContext.stopMessage("步骤 [" + step.id() + "]") + "\n");
+                return;
+            }
             retries++;
             retryCount.put(step.id(), retries);
             out.println("⚠️ 步骤 [" + step.id() + "] 审查未通过，正在重新执行...");

@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "max_pass_rate_drop": 0.05,
+  "max_token_median_ratio": 1.30,
+  "min_guard_block_rate": 1.0,
+  "require_case_set_match": true
+}

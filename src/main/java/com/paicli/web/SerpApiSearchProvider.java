@@ -2,6 +2,9 @@ package com.paicli.web;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.paicli.runtime.CancellationContext;
+import com.paicli.runtime.CancellationToken;
+import okhttp3.Call;
 import okhttp3.HttpUrl;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -74,7 +77,16 @@ public class SerpApiSearchProvider implements SearchProvider {
         Request request = new Request.Builder().url(url).get().build();
         log.info("SerpAPI search: query={}, topK={}", query, maxResults);
 
-        try (Response response = httpClient.newCall(request).execute()) {
+        long timeoutMillis = CancellationContext.remainingMillis(TimeUnit.SECONDS.toMillis(15), 0);
+        if (timeoutMillis <= 0 || CancellationContext.isCancelled()) {
+            throw new IOException("SerpAPI 搜索已取消或超过 Deadline");
+        }
+        Call call = httpClient.newCall(request);
+        call.timeout().timeout(timeoutMillis, TimeUnit.MILLISECONDS);
+        CancellationToken token = CancellationContext.current();
+        CancellationToken.Registration registration = token == null
+                ? CancellationToken.Registration.NO_OP : token.onCancel(call::cancel);
+        try (registration; Response response = call.execute()) {
             if (!response.isSuccessful()) {
                 if (response.code() == 401) {
                     throw new IOException("SerpAPI Key 无效或已过期");
@@ -83,6 +95,8 @@ public class SerpApiSearchProvider implements SearchProvider {
             }
             String body = response.body() == null ? "" : response.body().string();
             return parse(body, maxResults);
+        } finally {
+            call.cancel();
         }
     }
 

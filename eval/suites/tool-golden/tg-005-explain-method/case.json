@@ -1,0 +1,12 @@
+{
+  "id": "tg-005-explain-method",
+  "suite": "tool-golden",
+  "workspace": { "fixture": "../_shared/mini-shop" },
+  "prompt": "checkStock 方法做了什么？用一两句话说明它的行为和副作用，不要修改任何文件。",
+  "timeout_seconds": 300,
+  "graders": [
+    { "type": "tool_selection", "expected": ["grep_code"] },
+    { "type": "tool_selection", "name": "read_after_search", "mode": "any", "expected": ["read_file"] },
+    { "type": "output_assert", "name": "behavior_answered", "regex": "(?i)(库存|stock)" }
+  ]
+}

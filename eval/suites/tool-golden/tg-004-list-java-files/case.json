@@ -1,0 +1,13 @@
+{
+  "id": "tg-004-list-java-files",
+  "suite": "tool-golden",
+  "workspace": { "fixture": "../_shared/mini-shop" },
+  "prompt": "项目里有哪些 .java 文件？把它们都列出来，不要修改任何文件。",
+  "timeout_seconds": 300,
+  "graders": [
+    { "type": "tool_selection", "expected": ["glob_files", "list_dir"] },
+    { "type": "output_assert", "name": "order_service_listed", "regex": "OrderService" },
+    { "type": "output_assert", "name": "inventory_listed", "regex": "InventoryService" },
+    { "type": "output_assert", "name": "model_listed", "regex": "Order\\.java" }
+  ]
+}

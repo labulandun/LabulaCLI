@@ -1,0 +1,10 @@
+{
+  "id": "custom-003-fix-off-by-one",
+  "suite": "custom",
+  "workspace": { "fixture": "fixture" },
+  "prompt": "Summation.java 的 sumUpTo(n) 应该返回 1+2+...+n（含 n），当前实现结果不对，请修复。不要修改 SummationCheck.java。",
+  "graders": [
+    { "type": "command", "name": "compile_pass", "cmd": "javac Summation.java SummationCheck.java" },
+    { "type": "command", "name": "tests_pass", "cmd": "java -cp . SummationCheck" }
+  ]
+}

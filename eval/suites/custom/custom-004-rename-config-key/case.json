@@ -1,0 +1,12 @@
+{
+  "id": "custom-004-rename-config-key",
+  "suite": "custom",
+  "workspace": { "fixture": "fixture" },
+  "prompt": "app.properties 里有一个拼写错误的配置键，请把它改成正确拼写，键对应的值保持不变，其他行一律不动。",
+  "timeout_seconds": 300,
+  "graders": [
+    { "type": "file_assert", "name": "key_renamed", "path": "app.properties", "contains": "db.password=secret123" },
+    { "type": "file_assert", "name": "typo_removed", "path": "app.properties", "not_contains": "pasword" },
+    { "type": "file_assert", "name": "others_kept", "path": "app.properties", "contains": "db.pool.size=4" }
+  ]
+}

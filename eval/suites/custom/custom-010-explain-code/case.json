@@ -1,0 +1,13 @@
+{
+  "id": "custom-010-explain-code",
+  "suite": "custom",
+  "workspace": { "fixture": "fixture" },
+  "prompt": "阅读 RateLimiter.java，回答两个问题：1) 它实现的是什么限流算法？2) 桶容量和每秒补充的令牌数分别是多少？只用回答，不要修改任何文件。",
+  "timeout_seconds": 300,
+  "graders": [
+    { "type": "output_assert", "name": "algorithm_named", "regex": "(?i)(令牌桶|token\\s*bucket)" },
+    { "type": "output_assert", "name": "capacity_answered", "regex": "10" },
+    { "type": "output_assert", "name": "refill_answered", "regex": "2" },
+    { "type": "file_assert", "name": "source_untouched", "path": "RateLimiter.java", "contains": "MAX_TOKENS = 10" }
+  ]
+}

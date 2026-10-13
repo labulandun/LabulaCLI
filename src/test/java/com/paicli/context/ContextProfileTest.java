@@ -21,7 +21,10 @@ class ContextProfileTest {
         assertEquals(200_000, profile.maxContextWindow());
         assertEquals(160_000, profile.agentTokenBudget());                  // 200k × 0.8
         assertEquals(0.90, profile.compressionTriggerRatio(), 0.001);
-        assertEquals(180_000, profile.compressionTriggerTokens());          // 200k × 0.9
+        assertEquals(8_192, profile.responseReserveTokens());
+        assertEquals(2_048, profile.safetyMarginTokens());
+        assertEquals(189_760, profile.hardInputCeilingTokens());
+        assertEquals(170_784, profile.compressionTriggerTokens());          // hard ceiling × 0.9
         assertEquals(90_000, profile.shortTermMemoryBudget());              // 200k × 0.45
         assertTrue(profile.mcpResourceIndexEnabled());                      // window ≥ 32k
         assertTrue(profile.promptCachingSupported());
@@ -33,7 +36,8 @@ class ContextProfileTest {
 
         assertEquals(1_000_000, profile.maxContextWindow());
         assertEquals(800_000, profile.agentTokenBudget());                  // 1M × 0.8
-        assertEquals(900_000, profile.compressionTriggerTokens());          // 1M × 0.9
+        assertEquals(981_808, profile.hardInputCeilingTokens());
+        assertEquals(883_627, profile.compressionTriggerTokens());          // hard ceiling × 0.9
         assertEquals(450_000, profile.shortTermMemoryBudget());             // 1M × 0.45
         assertEquals("automatic-prefix-cache", profile.promptCacheMode());
         assertTrue(profile.mcpResourceIndexEnabled());
@@ -73,5 +77,56 @@ class ContextProfileTest {
         assertEquals(128_000, profile.maxContextWindow());
         assertEquals(0.90, profile.compressionTriggerRatio(), 0.001);
         assertFalse(profile.promptCachingSupported());
+    }
+
+    @Test
+    void explicitReservesAreClampedAndZeroCanDisableThem() {
+        ContextProfile clamped = ContextProfile.custom(8_000, 4_000, 99_999, 99_999);
+        assertEquals(2_000, clamped.responseReserveTokens());
+        assertEquals(800, clamped.safetyMarginTokens());
+        assertEquals(5_200, clamped.hardInputCeilingTokens());
+        assertEquals(4_680, clamped.compressionTriggerTokens());
+
+        ContextProfile zero = ContextProfile.custom(8_000, 4_000, 0, 0);
+        assertEquals(8_000, zero.hardInputCeilingTokens());
+        assertEquals(7_200, zero.compressionTriggerTokens());
+    }
+
+    @Test
+    void configuredReservesAcceptZeroAndInvalidValuesFallBack() {
+        String responseKey = "paicli.context.response.reserve.tokens";
+        String safetyKey = "paicli.context.safety.margin.tokens";
+        String oldResponse = System.getProperty(responseKey);
+        String oldSafety = System.getProperty(safetyKey);
+        try {
+            System.setProperty(responseKey, "-1");
+            System.setProperty(safetyKey, "not-a-number");
+            ContextProfile fallback = ContextProfile.from(null);
+            assertEquals(8_192, fallback.responseReserveTokens());
+            assertEquals(2_048, fallback.safetyMarginTokens());
+
+            System.setProperty(responseKey, "0");
+            System.setProperty(safetyKey, "0");
+            ContextProfile zero = ContextProfile.from(null);
+            assertEquals(0, zero.responseReserveTokens());
+            assertEquals(0, zero.safetyMarginTokens());
+
+            System.setProperty(responseKey, Integer.toString(Integer.MAX_VALUE));
+            System.setProperty(safetyKey, Integer.toString(Integer.MAX_VALUE));
+            ContextProfile clamped = ContextProfile.from(null);
+            assertEquals(32_000, clamped.responseReserveTokens());
+            assertEquals(12_800, clamped.safetyMarginTokens());
+        } finally {
+            restoreProperty(responseKey, oldResponse);
+            restoreProperty(safetyKey, oldSafety);
+        }
+    }
+
+    private static void restoreProperty(String key, String value) {
+        if (value == null) {
+            System.clearProperty(key);
+        } else {
+            System.setProperty(key, value);
+        }
     }
 }

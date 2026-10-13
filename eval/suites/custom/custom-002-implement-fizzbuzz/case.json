@@ -1,0 +1,10 @@
+{
+  "id": "custom-002-implement-fizzbuzz",
+  "suite": "custom",
+  "workspace": { "fixture": "fixture" },
+  "prompt": "实现 FizzBuzz.java 中的 render 方法：能被 3 整除返回 \"Fizz\"，能被 5 整除返回 \"Buzz\"，同时能被 3 和 5 整除返回 \"FizzBuzz\"，否则返回数字本身的字符串。不要修改 FizzBuzzCheck.java。",
+  "graders": [
+    { "type": "command", "name": "compile_pass", "cmd": "javac FizzBuzz.java FizzBuzzCheck.java" },
+    { "type": "command", "name": "tests_pass", "cmd": "java -cp . FizzBuzzCheck" }
+  ]
+}

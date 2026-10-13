@@ -1,0 +1,12 @@
+{
+  "id": "tg-002-find-constant",
+  "suite": "tool-golden",
+  "workspace": { "fixture": "../_shared/mini-shop" },
+  "prompt": "DISCOUNT_THRESHOLD 的值是多少？定义在哪个文件？不要修改任何文件。",
+  "timeout_seconds": 300,
+  "graders": [
+    { "type": "tool_selection", "expected": ["grep_code"] },
+    { "type": "output_assert", "name": "value_answered", "regex": "100" },
+    { "type": "output_assert", "name": "file_answered", "regex": "OrderService" }
+  ]
+}

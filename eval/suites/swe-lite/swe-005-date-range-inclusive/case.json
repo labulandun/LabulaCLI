@@ -1,0 +1,21 @@
+{
+  "id": "swe-005-date-range-inclusive",
+  "suite": "swe-lite",
+  "workspace": { "fixture": "fixture" },
+  "prompt": "DateRange.contains currently excludes both boundary dates. A range must be inclusive at start and end, return false for null dates, and an invalid range whose start is after its end must contain nothing. Fix it without changing the constructor or method signatures.",
+  "timeout_seconds": 600,
+  "graders": [
+    {
+      "type": "command",
+      "name": "fail_to_pass",
+      "cmd": "javac -encoding UTF-8 -d out src/*.java verify/FailToPass.java && java -cp out FailToPass",
+      "copy_from_case": ["verify/FailToPass.java"]
+    },
+    {
+      "type": "command",
+      "name": "pass_to_pass",
+      "cmd": "javac -encoding UTF-8 -d out src/*.java verify/PassToPass.java && java -cp out PassToPass",
+      "copy_from_case": ["verify/PassToPass.java"]
+    }
+  ]
+}

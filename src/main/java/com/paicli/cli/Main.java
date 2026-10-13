@@ -28,6 +28,8 @@ import com.paicli.mcp.McpServer;
 import com.paicli.mcp.McpServerManager;
 import com.paicli.mcp.McpServerStatus;
 import com.paicli.mcp.mention.AtMentionExpander;
+import com.paicli.observability.OpenTelemetryBootstrap;
+import com.paicli.observability.PaiCliTracing;
 import com.paicli.plan.ExecutionPlan;
 import com.paicli.rag.CodeIndex;
 import com.paicli.hitl.ApprovalPolicy;
@@ -192,13 +194,20 @@ public class Main {
 
     public static void main(String[] args) {
         configureAwtForCli();
+        configureLogging();
+        try (OpenTelemetryBootstrap telemetry =
+                     OpenTelemetryBootstrap.initialize(key -> loadConfigValue(key, null))) {
+            Runtime.getRuntime().addShutdownHook(
+                    new Thread(telemetry::close, "paicli-opentelemetry-shutdown"));
+            run(args, telemetry.tracing());
+        }
+    }
+
+    private static void run(String[] args, PaiCliTracing tracing) {
         if (isRuntimeServeCommand(args)) {
-            configureLogging();
-            startRuntimeApiAndBlock(args);
+            startRuntimeApiAndBlock(args, tracing);
             return;
         }
-
-        configureLogging();
 
         PaiCliConfig config = PaiCliConfig.load();
         LlmClient llmClient = LlmClientFactory.createFromConfig(config);
@@ -299,11 +308,17 @@ public class Main {
             hitlToolRegistry.setSkillRegistry(skillRegistry);
             hitlToolRegistry.setSkillContextBuffer(skillContextBuffer);
 
-            Agent reactAgent = new Agent(llmClient, hitlToolRegistry);
+            Agent reactAgent = new Agent(llmClient, hitlToolRegistry, tracing);
             reactAgent.setExternalContextSupplier(mcpServerManager::resourceIndexForPrompt);
             reactAgent.setSkillRegistry(skillRegistry);
             reactAgent.setSkillContextBuffer(skillContextBuffer);
-            DurableTaskManager taskManager = openTaskManager(llmClientRef);
+            String snapshotWarning = reactAgent.getToolRegistry().getSnapshotService()
+                    .startupWarning()
+                    .orElse("");
+            if (!snapshotWarning.isBlank()) {
+                startupNote = appendStartupNote(startupNote, "Side-Git 迁移保护: " + snapshotWarning);
+            }
+            DurableTaskManager taskManager = openTaskManager(llmClientRef, tracing);
             taskManager.start();
             Runtime.getRuntime().addShutdownHook(new Thread(taskManager::close, "paicli-task-shutdown"));
             renderer.updateStatus(statusInfo(reactAgent, mcpServerManager, skillRegistry, "idle"));
@@ -646,8 +661,9 @@ public class Main {
 
                         // 同步项目路径到 ToolRegistry，让 search_code 工具可以正常工作
                         String absPath = new File(indexPath).getAbsolutePath();
-                        reactAgent.getToolRegistry().setProjectPath(absPath);
-                        reactAgent.getMemoryManager().setProjectPath(absPath);
+                        if (reactAgent.switchProjectPath(absPath)) {
+                            ui.println("🔄 项目作用域已切换：已清空旧对话并轮换工具结果工件会话");
+                        }
                         continue;
                     }
                     case SEARCH_CODE -> {
@@ -780,7 +796,7 @@ public class Main {
                 && java.util.Arrays.stream(args).anyMatch("--http"::equalsIgnoreCase);
     }
 
-    private static void startRuntimeApiAndBlock(String[] args) {
+    private static void startRuntimeApiAndBlock(String[] args, PaiCliTracing tracing) {
         PaiCliConfig config = PaiCliConfig.load();
         LlmClient client = LlmClientFactory.createFromConfig(config);
         if (client == null) {
@@ -792,9 +808,10 @@ public class Main {
             RuntimeThreadStore store = new RuntimeThreadStore(RuntimeThreadStore.defaultDbPath());
             RuntimeApiServer server = new RuntimeApiServer(
                     store,
-                    prompt -> runHeadlessTask(prompt, client),
+                    prompt -> runHeadlessTask(prompt, client, tracing),
                     port,
-                    RuntimeApiServer.configuredApiKey());
+                    RuntimeApiServer.configuredApiKey(),
+                    tracing::takeLastCompletedRun);
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 server.close();
                 store.close();
@@ -827,16 +844,16 @@ public class Main {
         return defaultPort;
     }
 
-    private static String runHeadlessTask(String prompt, LlmClient llmClient) {
+    private static String runHeadlessTask(String prompt, LlmClient llmClient, PaiCliTracing tracing) {
         ToolRegistry registry = new ToolRegistry();
         registry.setProjectPath(Path.of(".").toAbsolutePath().normalize().toString());
-        Agent agent = new Agent(llmClient, registry);
-        return agent.run(prompt);
+        Agent agent = new Agent(llmClient, registry, tracing);
+        return agent.runForResult(prompt);
     }
 
-    private static DurableTaskManager openTaskManager(AtomicReference<LlmClient> llmClientRef) {
+    private static DurableTaskManager openTaskManager(AtomicReference<LlmClient> llmClientRef, PaiCliTracing tracing) {
         try {
-            return DurableTaskManager.openDefault(prompt -> runHeadlessTask(prompt, llmClientRef.get()));
+            return DurableTaskManager.openDefault(prompt -> runHeadlessTask(prompt, llmClientRef.get(), tracing));
         } catch (Exception e) {
             throw new IllegalStateException("后台任务管理器初始化失败: " + e.getMessage(), e);
         }
@@ -877,7 +894,7 @@ public class Main {
             thread.setDaemon(true);
             return thread;
         });
-        Future<String> future = executor.submit(task);
+        Future<String> future = executor.submit(CancellationContext.wrap(task));
         // 进入 raw mode 监听 ESC：raw mode 关 ICANON / ECHO / IEXTEN 但保留 ISIG，所以 Ctrl+C 仍能终止 PaiCLI。
         Attributes original = null;
         try {
@@ -889,6 +906,11 @@ public class Main {
                 }
             }
             while (!future.isDone()) {
+                if (token.isCancelled()) {
+                    future.cancel(true);
+                    executor.shutdownNow();
+                    return CancellationContext.stopMessage("当前任务");
+                }
                 if (original != null && readEscCancel(terminal)) {
                     token.cancel();
                     future.cancel(true);

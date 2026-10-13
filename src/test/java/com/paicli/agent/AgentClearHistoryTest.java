@@ -2,10 +2,13 @@ package com.paicli.agent;
 
 import com.paicli.llm.LlmClient;
 import com.paicli.skill.SkillContextBuffer;
+import com.paicli.tool.ToolRegistry;
+import com.paicli.tool.ToolResultArtifactStore;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -45,6 +48,8 @@ class AgentClearHistoryTest {
 
             List<LlmClient.Message> history = agent.getConversationHistory();
             assertEquals(1, history.size());
+            assertTrue(agent.getLastModelConversationView().isEmpty());
+            assertFalse(agent.getHistoryProjectionState().hasCheckpoint());
             assertFalse(history.get(0).content().contains("CLEAR_MARKER"),
                     "/clear must not preserve the previous query's retrieved memory in system prompt");
             assertFalse(history.get(0).content().contains("## 相关长期记忆"));
@@ -58,6 +63,60 @@ class AgentClearHistoryTest {
                 System.setProperty("paicli.memory.dir", oldMemoryDir);
             }
         }
+    }
+
+    @Test
+    void clearHistoryRotatesToolResultArtifactSession() {
+        ToolResultArtifactStore store = new ToolResultArtifactStore(
+                tempDir.resolve("artifacts"), tempDir, 1, 7);
+        ToolRegistry registry = new ToolRegistry(store) {
+            @Override
+            public String executeTool(String name, String argumentsJson) {
+                if ("large".equals(name)) {
+                    return "artifact-payload-".repeat(5_000);
+                }
+                return super.executeTool(name, argumentsJson);
+            }
+        };
+        registry.setProjectPath(tempDir.toString());
+        Agent agent = new Agent(new RecordingClient(List.of()), registry);
+        ToolRegistry.ToolExecutionResult result = registry.executeTools(List.of(
+                new ToolRegistry.ToolInvocation("call_clear", "large", "{}"))).get(0);
+        String oldHandle = result.artifactRef().handle();
+        String oldManifest = registry.getToolResultManifestHandle();
+        assertTrue(agent.getContextStatus().contains("Tool artifacts: 1 files"));
+
+        agent.clearHistory();
+
+        assertFalse(oldManifest.equals(registry.getToolResultManifestHandle()));
+        assertTrue(agent.getContextStatus().contains("Tool artifacts: 0 files"));
+        assertTrue(registry.executeTool("read_tool_result",
+                        "{\"handle\":\"" + oldHandle + "\",\"offset\":0,\"max_chars\":10}")
+                .startsWith("HANDLE_SCOPE_MISMATCH"));
+    }
+
+    @Test
+    void projectSwitchClearsMessagesThatReferenceTheOldArtifactScope() throws Exception {
+        Path firstProject = Files.createDirectory(tempDir.resolve("project-one"));
+        Path secondProject = Files.createDirectory(tempDir.resolve("project-two"));
+        ToolResultArtifactStore store = new ToolResultArtifactStore(
+                tempDir.resolve("project-artifacts"), firstProject, 1, 7);
+        ToolRegistry registry = new ToolRegistry(store);
+        registry.setProjectPath(firstProject.toString());
+        RecordingClient client = new RecordingClient(List.of(
+                new LlmClient.ChatResponse("assistant", "ok", null, 10, 2)));
+        Agent agent = new Agent(client, registry);
+        agent.run("remember this turn");
+        String oldManifest = registry.getToolResultManifestHandle();
+        assertTrue(agent.getConversationHistory().size() > 1);
+        assertFalse(agent.getLastModelConversationView().isEmpty());
+
+        assertTrue(agent.switchProjectPath(secondProject.toString()));
+
+        assertEquals(1, agent.getConversationHistory().size());
+        assertTrue(agent.getLastModelConversationView().isEmpty());
+        assertFalse(agent.getHistoryProjectionState().hasCheckpoint());
+        assertFalse(oldManifest.equals(registry.getToolResultManifestHandle()));
     }
 
     private static final class RecordingClient implements LlmClient {

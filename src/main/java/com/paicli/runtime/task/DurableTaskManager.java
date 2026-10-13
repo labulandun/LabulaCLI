@@ -1,5 +1,8 @@
 package com.paicli.runtime.task;
 
+import com.paicli.runtime.CancellationContext;
+import com.paicli.runtime.CancellationToken;
+
 import java.io.Closeable;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -21,6 +24,7 @@ public class DurableTaskManager implements Closeable {
     private final int workerCount;
     private final Connection connection;
     private final Map<String, Thread> runningTasks = new ConcurrentHashMap<>();
+    private final Map<String, CancellationToken> runningTokens = new ConcurrentHashMap<>();
     private ExecutorService workers;
     private volatile boolean running;
 
@@ -144,7 +148,11 @@ public class DurableTaskManager implements Closeable {
         if (current.isEmpty() || current.get().terminal()) {
             return false;
         }
-        Thread thread = runningTasks.remove(id);
+        CancellationToken token = runningTokens.get(id);
+        if (token != null) {
+            token.cancel();
+        }
+        Thread thread = runningTasks.get(id);
         if (thread != null) {
             thread.interrupt();
         }
@@ -169,30 +177,54 @@ public class DurableTaskManager implements Closeable {
                     continue;
                 }
                 String taskId = task.id();
+                CancellationToken token = CancellationContext.startRun();
+                runningTokens.put(taskId, token);
                 runningTasks.put(taskId, Thread.currentThread());
                 Instant startedAt = Instant.now();
-                try {
+                try (CancellationContext.Scope ignored = CancellationContext.bind(token)) {
+                    synchronized (this) {
+                        DurableTask latest = find(taskId).orElse(null);
+                        if (latest == null || latest.status() == TaskStatus.CANCELED) {
+                            token.cancel();
+                            continue;
+                        }
+                    }
                     String result = runner.run(task.prompt());
                     synchronized (this) {
                         DurableTask latest = find(taskId).orElse(null);
                         if (latest != null && latest.status() != TaskStatus.CANCELED) {
-                            markTerminal(taskId, TaskStatus.COMPLETED, result, null, startedAt);
+                            if (token.isDeadlineExceeded()) {
+                                markTerminal(taskId, TaskStatus.TIMED_OUT, result,
+                                        "Agent 全链路 Deadline 已耗尽", startedAt);
+                            } else {
+                                markTerminal(taskId, TaskStatus.COMPLETED, result, null, startedAt);
+                            }
                         }
                     }
                 } catch (InterruptedException e) {
-                    Thread.interrupted();
                     synchronized (this) {
-                        markTerminal(taskId, TaskStatus.CANCELED, "", "任务线程被中断", startedAt);
+                        markTerminal(taskId,
+                                token.isDeadlineExceeded() ? TaskStatus.TIMED_OUT : TaskStatus.CANCELED,
+                                "",
+                                token.isDeadlineExceeded() ? "Agent 全链路 Deadline 已耗尽" : "任务线程被中断",
+                                startedAt);
                     }
                 } catch (Exception e) {
                     synchronized (this) {
                         DurableTask latest = find(taskId).orElse(null);
                         if (latest != null && latest.status() != TaskStatus.CANCELED) {
-                            markTerminal(taskId, TaskStatus.FAILED, "", e.getMessage(), startedAt);
+                            markTerminal(taskId,
+                                    token.isDeadlineExceeded() ? TaskStatus.TIMED_OUT : TaskStatus.FAILED,
+                                    "", e.getMessage(), startedAt);
                         }
                     }
                 } finally {
                     runningTasks.remove(taskId);
+                    runningTokens.remove(taskId);
+                    CancellationContext.clear(token);
+                    if (Thread.currentThread().isInterrupted()) {
+                        Thread.interrupted();
+                    }
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -327,9 +359,12 @@ public class DurableTaskManager implements Closeable {
     }
 
     @Override
-    public synchronized void close() {
-        running = false;
-        notifyAll();
+    public void close() {
+        synchronized (this) {
+            running = false;
+            notifyAll();
+        }
+        runningTokens.values().forEach(CancellationToken::cancel);
         if (workers != null) {
             workers.shutdownNow();
             try {

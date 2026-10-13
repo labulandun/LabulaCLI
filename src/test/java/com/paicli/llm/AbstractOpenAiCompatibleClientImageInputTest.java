@@ -15,9 +15,12 @@ import java.nio.file.Path;
 import java.util.concurrent.atomic.AtomicReference;
 
 import com.paicli.image.ImageReferenceParser;
+import com.paicli.context.ContextViewBuildException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class AbstractOpenAiCompatibleClientImageInputTest {
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -49,6 +52,51 @@ class AbstractOpenAiCompatibleClientImageInputTest {
             assertEquals("image_url", content.get(1).path("type").asText());
             assertEquals("data:image/png;base64,aGVsbG8=",
                     content.get(1).path("image_url").path("url").asText());
+        }
+    }
+
+    @Test
+    void transportUsesTheSharedToolsWireShape() throws Exception {
+        try (MockWebServer server = new MockWebServer()) {
+            server.enqueue(new MockResponse()
+                    .setHeader("Content-Type", "text/event-stream")
+                    .setBody("""
+                            data: {"choices":[{"delta":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":12,"completion_tokens":1}}
+
+                            data: [DONE]
+
+                            """));
+            TestClient client = new TestClient(server.url("/chat/completions").toString());
+            List<LlmClient.Tool> tools = List.of(new LlmClient.Tool(
+                    "read_file",
+                    "read a file",
+                    MAPPER.readTree("{\"type\":\"object\",\"properties\":{}}")));
+
+            client.chat(List.of(LlmClient.Message.user("hello")), tools);
+
+            JsonNode actual = MAPPER.readTree(server.takeRequest().getBody().readUtf8()).path("tools");
+            JsonNode shared = LlmRequestWireFormat.toolDefinitions(MAPPER, tools);
+            assertEquals(shared, actual);
+            assertEquals("function", actual.path(0).path("type").asText());
+            assertEquals("read_file", actual.path(0).path("function").path("name").asText());
+            assertEquals("object", actual.path(0).path("function")
+                    .path("parameters").path("type").asText());
+        }
+    }
+
+    @Test
+    void transportHardCeilingBlocksBeforeOpeningHttpRequest() throws Exception {
+        try (MockWebServer server = new MockWebServer()) {
+            TestClient client = new TestClient(
+                    server.url("/chat/completions").toString(), 8_000);
+
+            ContextViewBuildException error = assertThrows(
+                    ContextViewBuildException.class,
+                    () -> client.chat(List.of(new LlmClient.Message(
+                            "user", "x".repeat(30_000), null, null, null, List.of())), null));
+
+            assertTrue(error.getMessage().startsWith(ContextViewBuildException.CODE));
+            assertEquals(0, server.getRequestCount());
         }
     }
 
@@ -118,6 +166,7 @@ class AbstractOpenAiCompatibleClientImageInputTest {
 
                             """));
             KimiClient client = new KimiClient("test-key", "kimi-k2.6", server.url("/v1").toString());
+            assertTrue(client.replaysReasoningContent());
 
             client.chat(List.of(LlmClient.Message.assistant(
                     "hidden reasoning",
@@ -150,6 +199,7 @@ class AbstractOpenAiCompatibleClientImageInputTest {
                             """));
             DeepSeekClient client = new DeepSeekClient("test-key", "deepseek-v4-pro",
                     server.url("/chat/completions").toString());
+            assertTrue(client.replaysReasoningContent());
 
             client.chat(List.of(LlmClient.Message.assistant(
                     "hidden reasoning",
@@ -370,9 +420,15 @@ class AbstractOpenAiCompatibleClientImageInputTest {
 
     private static final class TestClient extends AbstractOpenAiCompatibleClient {
         private final String apiUrl;
+        private final int contextWindow;
 
         private TestClient(String apiUrl) {
+            this(apiUrl, 128_000);
+        }
+
+        private TestClient(String apiUrl, int contextWindow) {
             this.apiUrl = apiUrl;
+            this.contextWindow = contextWindow;
         }
 
         @Override
@@ -393,6 +449,11 @@ class AbstractOpenAiCompatibleClientImageInputTest {
         @Override
         public String getProviderName() {
             return "test";
+        }
+
+        @Override
+        public int maxContextWindow() {
+            return contextWindow;
         }
 
         @Override

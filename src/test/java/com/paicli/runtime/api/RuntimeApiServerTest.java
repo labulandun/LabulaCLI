@@ -1,5 +1,6 @@
 package com.paicli.runtime.api;
 
+import com.paicli.observability.PaiCliTracing;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -9,6 +10,9 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.Optional;
+
+import com.paicli.context.ContextViewBuildException;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -17,7 +21,12 @@ class RuntimeApiServerTest {
     @Test
     void exposesThreadTurnAndSseEvents(@TempDir Path tempDir) throws Exception {
         try (RuntimeThreadStore store = new RuntimeThreadStore(tempDir.resolve("runtime.db"));
-             RuntimeApiServer server = new RuntimeApiServer(store, prompt -> "reply:" + prompt, 0, "secret")) {
+             RuntimeApiServer server = new RuntimeApiServer(
+                     store,
+                     prompt -> "reply:" + prompt,
+                     0,
+                     "secret",
+                     () -> Optional.of(new PaiCliTracing.TraceReference("trace-123", "span-456")))) {
             server.start();
             HttpClient client = HttpClient.newHttpClient();
             String base = "http://127.0.0.1:" + server.port();
@@ -38,6 +47,8 @@ class RuntimeApiServerTest {
             assertTrue(events.contains("event: message.delta"));
             assertTrue(events.contains("reply:hello"));
             assertTrue(events.contains("event: turn.completed"));
+            assertTrue(events.contains("\"trace_id\":\"trace-123\""));
+            assertTrue(events.contains("\"root_observation_id\":\"span-456\""));
         }
     }
 
@@ -58,6 +69,37 @@ class RuntimeApiServerTest {
         }
     }
 
+    @Test
+    void reportsContextViewBuildFailureAsFailedTurn(@TempDir Path tempDir) throws Exception {
+        try (RuntimeThreadStore store = new RuntimeThreadStore(tempDir.resolve("runtime-failed.db"));
+             RuntimeApiServer server = new RuntimeApiServer(
+                     store,
+                     prompt -> {
+                         throw new IllegalStateException(ContextViewBuildException.CODE
+                                 + ": estimated input exceeds hard input ceiling");
+                     },
+                     0,
+                     "secret")) {
+            server.start();
+            HttpClient client = HttpClient.newHttpClient();
+            String base = "http://127.0.0.1:" + server.port();
+            HttpResponse<String> created = client.send(
+                    request(base + "/v1/threads", "POST", "").build(),
+                    HttpResponse.BodyHandlers.ofString());
+            String threadId = extract(created.body(), "thread_");
+
+            client.send(request(base + "/v1/threads/" + threadId + "/turns", "POST",
+                            "{\"input\":\"oversized\"}").build(),
+                    HttpResponse.BodyHandlers.ofString());
+            String events = waitForTerminalEvents(client, base, threadId);
+
+            assertTrue(events.contains("event: turn.failed"));
+            assertTrue(events.contains("\"status\":\"failed\""));
+            assertTrue(events.contains(ContextViewBuildException.CODE));
+            assertFalse(events.contains("event: turn.completed"));
+        }
+    }
+
     private static HttpRequest.Builder request(String url, String method, String body) {
         HttpRequest.BodyPublisher publisher = body == null || body.isEmpty()
                 ? HttpRequest.BodyPublishers.noBody()
@@ -70,12 +112,16 @@ class RuntimeApiServerTest {
     }
 
     private static String waitForEvents(HttpClient client, String base, String threadId) throws Exception {
+        return waitForTerminalEvents(client, base, threadId);
+    }
+
+    private static String waitForTerminalEvents(HttpClient client, String base, String threadId) throws Exception {
         long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
         while (System.nanoTime() < deadline) {
             HttpResponse<String> response = client.send(request(base + "/v1/threads/" + threadId + "/events", "GET", "")
                             .build(),
                     HttpResponse.BodyHandlers.ofString());
-            if (response.body().contains("turn.completed")) {
+            if (response.body().contains("turn.completed") || response.body().contains("turn.failed")) {
                 return response.body();
             }
             Thread.sleep(30);
@@ -89,5 +135,18 @@ class RuntimeApiServerTest {
         assertTrue(start >= 0, body);
         int end = body.indexOf('"', start);
         return body.substring(start, end);
+    }
+
+    /** 默认必须绑回环：放开监听地址等于把 Agent 运行时暴露到网络，只能由容器场景显式开启。 */
+    @Test
+    void bindHostDefaultsToLoopbackAndOnlyOpensWhenConfigured() {
+        assertEquals("127.0.0.1", RuntimeApiServer.configuredBindHost());
+        System.setProperty("paicli.runtime.api.host", "0.0.0.0");
+        try {
+            assertEquals("0.0.0.0", RuntimeApiServer.configuredBindHost());
+        } finally {
+            System.clearProperty("paicli.runtime.api.host");
+        }
+        assertEquals("127.0.0.1", RuntimeApiServer.configuredBindHost());
     }
 }

@@ -43,11 +43,24 @@ For the primary entry point, see `/AGENTS.md`.
 
 设计取舍：长上下文模型默认不再以 80% x window 为硬限。死循环防护由 stagnation 检测（连续 3 轮相同工具调用）和 hardMaxIterations（50 轮）兜底。Token 显示行 `📊 Token: 已用 X / Y` 的 Y 是软提示，不代表强制限制。
 
-### LLM HTTP Timeout Config
+### Runtime Deadline + LLM Resilience Config
 
-系统属性 > 默认值：`paicli.llm.connect.timeout.seconds`(60) / `paicli.llm.read.timeout.seconds`(300) / `paicli.llm.write.timeout.seconds`(60) / `paicli.llm.call.timeout.seconds`(600)
+读取顺序统一为系统属性 > 环境变量 > 进程当前工作目录 `.env` > 用户 `~/.env` > 默认值；配置在进程内首次加载后保持不变，CLI `/cd` 不会重新加载这些值。
 
-SSE 流式下 readTimeout 是两次 read 间最大间隔，GLM-5.1 生成大段 reasoning 时可能长时间静默，所以放宽到 300 秒。
+| 行为 | 系统属性 / 环境变量 | 默认值 |
+|------|---------------------|--------|
+| 根 Agent Deadline | `paicli.agent.deadline.seconds` / `PAICLI_AGENT_DEADLINE_SECONDS` | 600s |
+| Plan/Team 单步上限 | `paicli.agent.step.deadline.seconds` / `PAICLI_AGENT_STEP_DEADLINE_SECONDS` | 180s |
+| 收尾预留 | `paicli.agent.finalization.reserve.seconds` / `PAICLI_AGENT_FINALIZATION_RESERVE_SECONDS` | 5s |
+| LLM 单次尝试 / 首 token | `paicli.llm.attempt.timeout.seconds` / `PAICLI_LLM_ATTEMPT_TIMEOUT_SECONDS`; `paicli.llm.first.token.timeout.seconds` / `PAICLI_LLM_FIRST_TOKEN_TIMEOUT_SECONDS` | 180s / 60s |
+| HTTP connect/read/write/call | `paicli.llm.connect.timeout.seconds` / `PAICLI_LLM_CONNECT_TIMEOUT_SECONDS`; `paicli.llm.read.timeout.seconds` / `PAICLI_LLM_READ_TIMEOUT_SECONDS`; `paicli.llm.write.timeout.seconds` / `PAICLI_LLM_WRITE_TIMEOUT_SECONDS`; `paicli.llm.call.timeout.seconds` / `PAICLI_LLM_CALL_TIMEOUT_SECONDS` | 60s / 300s / 60s / 600s |
+| 最大重试 / 退避 | `paicli.llm.max.retries` / `PAICLI_LLM_MAX_RETRIES`; `paicli.llm.retry.base.delay.millis` / `PAICLI_LLM_RETRY_BASE_DELAY_MILLIS`; `paicli.llm.retry.max.delay.millis` / `PAICLI_LLM_RETRY_MAX_DELAY_MILLIS` | 1 / 250ms / 2000ms |
+| 熔断开关 / 阈值 | `paicli.llm.circuit.enabled` / `PAICLI_LLM_CIRCUIT_ENABLED`; `paicli.llm.circuit.failure.threshold` / `PAICLI_LLM_CIRCUIT_FAILURE_THRESHOLD` | true / 3 |
+| 熔断窗口 / OPEN 冷却 / HALF_OPEN 并发探针 | `paicli.llm.circuit.window.seconds` / `PAICLI_LLM_CIRCUIT_WINDOW_SECONDS`; `paicli.llm.circuit.open.seconds` / `PAICLI_LLM_CIRCUIT_OPEN_SECONDS`; `paicli.llm.circuit.half.open.probes` / `PAICLI_LLM_CIRCUIT_HALF_OPEN_PROBES` | 60s / 30s / 1 |
+
+根任务使用单调时钟绝对 Deadline；Plan/Team step、LLM attempt、工具/MCP 都取父级剩余预算与自身上限的较小值。SSE `readTimeout` 是两次 read 的最大静默间隔，`first-token timeout` 与 `call timeout` 分别约束首次有效增量和整次调用。Deadline/取消会主动取消 OkHttp Call、命令进程和子 Future。
+
+LLM 仅在尚未收到 reasoning/content/tool-call 流式增量时，对连接/EOF/Socket 超时、408、429、5xx 等瞬时错误重试；退避和 `Retry-After` 必须落在剩余预算内。最大重试配置限制为 0–3，熔断阈值限制为 1–100，HALF_OPEN 探针限制为 1–16。熔断按 `provider + model + endpoint` 维护 CLOSED/OPEN/HALF_OPEN 状态，OPEN 时快速失败；当前没有自动 Provider failover。
 
 ### Web Search Provider Config
 
@@ -85,18 +98,24 @@ scheme 白名单(http/https) / 主机黑名单(localhost/loopback/link-local/sit
 
 ### Long Context Engineering
 
-- `ContextProfile` 计算 short/balanced/long 模式
+- `ContextProfile` 按模型 `maxContextWindow` 统一派生预算和阈值，不再维护 short/balanced/long 模式分档
 - GLM-5.1: 200k / DeepSeek V4: 1M / StepFun: 256k / Kimi K2.6: 256k / FreeLLMAPI: 128k
-- long 模式(>=100k)：跳过 Memory 自动摘要，search_code 语义辅助 topK=20，MCP resources 自动索引；精确代码定位仍优先实时 glob/grep/read
+- 完整请求估算由 `RequestContextEstimator` 统一组成：message/contentParts/image、仅 provider 实际 replay 的 reasoning、tool-call id/name/arguments、tool_call_id、message framing、实际 tools wire schema 和 request envelope；cached input 仍占窗口
+- `hardInputCeiling = window - responseReserve - safetyMargin`；response reserve 默认 8,192（clamp 到 window 25%），safety 默认 `max(2,048, window 1%)`（clamp 到 window 10%），soft compression trigger 为 hard ceiling 的 90%
+- MCP resources 索引在 window >=32k 时启用；精确代码定位优先实时 glob/grep/read，search_code 保留为语义辅助
 - prompt caching：能力声明 + cached usage 解析
 
 ### Memory System
 
 - 两道压缩：
   1. `ContextCompressor` 压缩 shortTermMemory
-  2. `ConversationHistoryCompactor` 将 conversationHistory（真正发给 LLM 的消息）压缩为固定 Markdown 结构摘要
-- 第二道压缩切割在 user message 边界，保留最近 3 个 user 起算的尾部
-- 三条路径(ReAct/Plan/SubAgent)都接入第二道压缩
+  2. `ConversationHistoryCompactor` 从完整 source conversationHistory 投影出“结构化摘要 + recent tail”的不可变 model view，不修改 source
+- 第二道压缩切割在 user message 边界，保留最近 3 个 user 起算的尾部；checkpoint 只增量总结新覆盖前缀，prefix digest 校验 role/content/contentParts/tool/reasoning 等请求相关字段，source append baseline/最近观察 digest 会拒绝 retained tail 的插入、删除、重排或覆盖
+- ReAct、Plan task、Worker SubAgent 的业务 `chat()` 都只发送 model view；当前 system prompt 每轮直接进入 view，artifact manifest/count/latest handle 作为动态恢复索引附加
+- 摘要输出限制为 16,000 chars / 约 4,096 estimated tokens；失败不提交 checkpoint，有旧 checkpoint 时保留旧摘要并携带完整当前 tail，否则发送 source 快照
+- `/clear`、项目切换、模型切换及 SubAgent/Plan 新任务重置 projection state；`getConversationHistory()` 仍是 source，`getLastModelConversationView()` 用于调试最近请求
+- ReAct、Plan task、Worker SubAgent 以同一完整请求估算触发投影；Planner、摘要请求和 short-term compressor 也在 provider 前执行 hard gate。任何包含完整当前 tail 的候选超限时不发送请求、不提交新 checkpoint，并返回 `CONTEXT_VIEW_BUILD_FAILED`
+- `/context`、底部 `ctx` 与 request log 共用 estimated input 口径；headless Runtime/Durable Task 将 `CONTEXT_VIEW_BUILD_FAILED` 映射为 failed。估算不是 provider 官方 tokenizer，response reserve 也不等同于 provider `max_tokens`
 - 长期记忆只通过 `/save` 或用户明确要求保存
 - 长期记忆只保存跨会话稳定事实，不保存临时指令；默认项目级作用域，跨项目通用偏好才用 global
 - 长期记忆管理命令：`/memory list`、`/memory search <关键词>`、`/memory delete <id>`、`/memory clear`
@@ -105,7 +124,7 @@ scheme 白名单(http/https) / 主机黑名单(localhost/loopback/link-local/sit
 
 - 三角色：Planner / Worker(默认 2 个) / Reviewer
 - 流程：规划 → 按依赖分配 Worker → Reviewer 审查 → 未通过重试(最多 2 次)
-- SubAgent IOException 返回 ERROR 类型
+- SubAgent 将 LLM timeout / canceled / IOException 分别转成可区分的 ERROR 消息
 - 所有子代理共享 ToolRegistry 和 MemoryManager
 
 ### HITL System
@@ -174,7 +193,7 @@ scheme 白名单(http/https) / 主机黑名单(localhost/loopback/link-local/sit
 - 当前开屏 Banner 是无右侧盒线边框的简洁布局，避免 ANSI/CJK 字宽导致竖线错位
 - InlineRenderer 复用 JLine 4 的编辑能力，默认提示符是 `* `，右提示显示 `message / @path / @image`
 - BottomStatusBar 是 JLine `Status` 托管的底部 dock：由 JLine 负责滚动区域和状态行位置，不再手写 `\n`、`moveUp`、`CLEAR_TO_EOS` 或绝对光标行号；dock 上层展示 YOLO/HITL 与 MCP/Skill 摘要，下层展示 model、phase、ctx、token、cost、elapsed 与 cwd。`ctx` 只表示当前仍会带入下一轮请求的上下文估算，`in/out/cache` 表示最近任务调用统计。
-- `/clear` 清空当前 ReAct conversationHistory、shortTermMemory 和待注入 SkillContextBuffer，并重建不含上一轮检索记忆的 system prompt；长期记忆条目保留，后续只会按新查询重新检索注入。
+- `/clear` 清空当前 ReAct source conversationHistory、history projection state、shortTermMemory 和待注入 SkillContextBuffer，轮换 artifact session，并重建不含上一轮检索记忆的 system prompt；长期记忆条目保留，后续只会按新查询重新检索注入。
 - 普通任务和斜杠命令提交后都会以 `>` 暗色整行块回写原始输入，避免 JLine accept 后清掉编辑行导致结果区看不到刚执行的命令
 - InlineRenderer 不使用独立 JLine `Display.update()` 维护 thinking 临时区；真实终端验证发现独立 Display 会在 transcript/status 输出后从错误位置向上清屏。当前实现用固定高度 live 区重写自身行，content/tool 边界先清理 live 区再追加 transcript。
 - 交互期输出优先走 `Renderer.stream()`；`Main`、`PlanExecuteAgent`、`Planner`、`AgentOrchestrator` 都可接收同一个 renderer 输出流，避免绕过 inline renderer 直接写 stdout
@@ -188,9 +207,12 @@ scheme 白名单(http/https) / 主机黑名单(localhost/loopback/link-local/sit
 
 ### Git Side-History Snapshot (Phase 18)
 
-- side-git 在 ~/.paicli/snapshots/ 维护独立仓库（JGit，不依赖系统 git）
+- side-git 在 `~/.paicli/snapshots/` 维护 bare 仓库（JGit，不依赖系统 git），不配置项目 worktree
+- PaiCLI 扫描工作区并通过 `ObjectInserter` / `DirCache` / `CommitBuilder` 构建快照，只推进 `refs/paicli/snapshots/history`，不操作普通 `HEAD`
 - pre-turn 同步，post-turn 异步
 - revert_turn 纳入 HITL/AuditLog，恢复前先创建 pre-restore 快照
+- 启动检测到项目 `.git` 指向快照根时会禁用快照并报告迁移错误；`/snapshot clean` 会拒绝删除与项目当前 GitDir 重叠的目录，并等待异步写入结束
+- 旧版 Side-Git 的快照 HEAD 会迁移为独立快照引用但不再推进 HEAD；已经混入项目/远端历史的提交不会自动重写
 
 ### Prompt Layering (Phase 19)
 
@@ -202,8 +224,10 @@ scheme 白名单(http/https) / 主机黑名单(localhost/loopback/link-local/sit
 ### Async Tasks + Runtime API (Phase 20)
 
 - DurableTaskManager(SQLite) / CLI: /task, /task list, /task add, /task cancel, /task log
+- Durable Task 终态区分 `completed` / `failed` / `timed_out` / `canceled`；取消与 Deadline 会先触发底层资源取消，再持久化终态
 - Runtime API: `serve --http --port 8080`，仅 127.0.0.1，需 API Key
 - 端点：POST /v1/threads / POST /v1/threads/{id}/turns / GET /v1/threads/{id}/events
+- Runtime turn 使用同一产品 Deadline，失败事件的 `status` 区分 `timeout` / `canceled` / `failed`
 
 ### Image Input (Phase 21)
 
@@ -230,7 +254,7 @@ ReAct 主循环 / 对话历史 / 工具调用与结果回灌
 Multi-Agent 编排器 / 三角色管理 / 按依赖分配 / 审查重试
 
 ### SubAgent.java
-可配置角色子代理 / 独立对话历史 / Worker 用工具、Planner/Reviewer 不用
+可配置角色子代理 / 独立 source history + projection checkpoint / Worker 用工具、Planner/Reviewer 不用；`clearHistory()` 只清自身 history/state，不轮换共享 artifact store
 
 ### Planner.java
 LLM 生成计划 JSON / 简单任务最小计划 / 重编号 task_1..N / 依赖计算
@@ -239,7 +263,15 @@ LLM 生成计划 JSON / 简单任务最小计划 / 重编号 task_1..N / 依赖�
 DAG 拓扑排序 / 可执行任务判定 / 进度可视化
 
 ### ToolRegistry.java
-11 个核心内置工具 + MCP 动态工具 / executeTools() 并行入口 / ToolInvocation / ToolExecutionResult。代码理解默认路径是 `glob_files` / `grep_code` / `read_file` 现用现查，`grep_code` 优先走 ripgrep 并按 `max_results` / `head_limit` / `max_chars` 渐进返回，`search_code` 保留为 RAG 语义辅助。确定性搜索链路的回归样例见 `docs/code-search-golden-set.md`。
+内置工具 + MCP 动态工具 / executeTools() 并行入口 / ToolInvocation / ToolExecutionResult。Phase 90.1 在顶层 `executeTracedInvocation` 完成原始工具执行后统一生成模型投影：超过阈值的文本落为 UTF-8 工件，`result()` 只带预览、digest、manifest 和 opaque handle；`displayPreview` / `resultMetadata` 服务 UI 与 partial 判断，图片 parts 保持独立。`read_tool_result` 严格分页且 spill-exempt，`readOnlyExploreView()` 共享主 session store。代码理解默认路径是 `glob_files` / `grep_code` / `read_file` 现用现查，`grep_code` 优先走 ripgrep 并按 `max_results` / `head_limit` / `max_chars` 渐进返回，`search_code` 保留为 RAG 语义辅助。确定性搜索链路的回归样例见 `docs/code-search-golden-set.md`。
+
+工具工件默认目录为 `~/.paicli/context-artifacts/<project-hash>/<session-id>/`；单工件 32 MiB、session 256 MiB、保留 7 天（成功读取会刷新 session 访问时间，启动时清理超过留存期且未访问的旧目录）。配置读取遵循 system property > environment > 项目 `.env` > 用户 `~/.env` > 默认值：`paicli.tool.result.dir` / `.spill.tokens` / `.retention.days`。工件正文不自动脱敏且是本机明文；producer 在 ToolRegistry 之前已经截断的内容不属于可恢复承诺。
+
+Phase 90.2 的 `ToolResultArtifactIndex` 从 store 内存 manifest 取得稳定 handle、当前 count 和最近 5 个工件元数据；同 session 新工件只刷新 model view 中的动态索引，不使 summary checkpoint 失效。`/clear` 或项目 rebind 改变 manifest handle，会与 projection state 一起失效。
+
+Phase 90.3 的 `LlmRequestWireFormat` 是 transport 与 estimator 的 tools schema/request envelope 共同来源；DeepSeek/Kimi 的 reasoning replay 能力和 Step `reasoning_format` / `reasoning_effort` request fields 由 `LlmClient` 能力声明统一透传。配置读取遵循既有优先级：`paicli.context.response.reserve.tokens` / `PAICLI_CONTEXT_RESPONSE_RESERVE_TOKENS`、`paicli.context.safety.margin.tokens` / `PAICLI_CONTEXT_SAFETY_MARGIN_TOKENS`。
+
+`/index <新路径>` 改变项目根时会同步清空旧 conversation history/short-term memory 并切换 artifact session，避免旧项目句柄进入新 scope 后反复读取失败。
 
 ### MCP Package
 McpServerManager / McpClient / JsonRpcClient / StdioTransport / StreamableHttpTransport / McpSchemaSanitizer / resources/ / mention/ / notifications/
@@ -252,6 +284,7 @@ TuiBootstrap / LanternaWindow / TuiSessionController / pane/ / hitl/ / history/ 
 - DeepSeekClient：deepseek-v4-flash，thinking + tool calls 带回 reasoning_content
 - StepClient：step-3.5-flash，可通过 STEP_BASE_URL 切通道
 - KimiClient：kimi-k2.6，thinking + tool calls 带回 reasoning_content
+- `LlmClient.replaysReasoningContent()` 是公开能力声明：DeepSeek/Kimi 为 true，Tracing wrapper 透传；请求构造和 summary checkpoint 失效判断共用该值
 - FreeLlmApiClient：auto，默认 http://localhost:5173/v1，OpenAI-compatible 本地网关；可用 `/config provider freellmapi ...` 写入配置后 `/model freellmapi` 切换
 
 ---

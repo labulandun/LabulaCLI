@@ -1,5 +1,8 @@
 package com.paicli.web;
 
+import com.paicli.runtime.CancellationContext;
+import com.paicli.runtime.CancellationToken;
+import okhttp3.Call;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
@@ -64,7 +67,17 @@ public class WebFetcher {
                 .build();
 
         log.info("web_fetch: GET {}", url);
-        try (Response response = httpClient.newCall(request).execute()) {
+        long timeoutMillis = CancellationContext.remainingMillis(
+                TimeUnit.SECONDS.toMillis(DEFAULT_TIMEOUT_SECONDS), 0);
+        if (timeoutMillis <= 0 || CancellationContext.isCancelled()) {
+            throw new IOException("web_fetch 已取消或超过 Deadline");
+        }
+        Call call = httpClient.newCall(request);
+        call.timeout().timeout(timeoutMillis, TimeUnit.MILLISECONDS);
+        CancellationToken token = CancellationContext.current();
+        CancellationToken.Registration registration = token == null
+                ? CancellationToken.Registration.NO_OP : token.onCancel(call::cancel);
+        try (registration; Response response = call.execute()) {
             if (!response.isSuccessful()) {
                 throw new IOException("HTTP " + response.code() + " " + response.message());
             }
@@ -79,6 +92,8 @@ public class WebFetcher {
             String text = new String(bytes, charset);
             String contentType = response.header("Content-Type", "");
             return new RawResponse(url, text, contentType, charset.name(), truncated);
+        } finally {
+            call.cancel();
         }
     }
 

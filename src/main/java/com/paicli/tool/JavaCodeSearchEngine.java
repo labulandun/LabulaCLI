@@ -1,5 +1,7 @@
 package com.paicli.tool;
 
+import com.paicli.runtime.CancellationContext;
+
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileVisitResult;
@@ -27,6 +29,9 @@ final class JavaCodeSearchEngine implements CodeSearchEngine {
 
     @Override
     public CodeSearchResult search(CodeSearchRequest request) {
+        if (CancellationContext.isCancelled()) {
+            return new CodeSearchResult("java", List.of(), true, "Java 搜索已取消或超过 Deadline");
+        }
         Pattern contentPattern;
         try {
             int flags = request.caseSensitive() ? 0 : Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE;
@@ -51,6 +56,9 @@ final class JavaCodeSearchEngine implements CodeSearchEngine {
             Files.walkFileTree(request.root(), new SimpleFileVisitor<>() {
                 @Override
                 public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+                    if (CancellationContext.isCancelled()) {
+                        return FileVisitResult.TERMINATE;
+                    }
                     String name = dir.getFileName() == null ? "" : dir.getFileName().toString();
                     if (!dir.equals(request.projectRoot()) && excludedDirs.contains(name)) {
                         return FileVisitResult.SKIP_SUBTREE;
@@ -60,6 +68,9 @@ final class JavaCodeSearchEngine implements CodeSearchEngine {
 
                 @Override
                 public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                    if (CancellationContext.isCancelled()) {
+                        return FileVisitResult.TERMINATE;
+                    }
                     if (matches.size() >= request.maxResults() || !Files.isRegularFile(file)) {
                         return FileVisitResult.CONTINUE;
                     }
@@ -82,6 +93,10 @@ final class JavaCodeSearchEngine implements CodeSearchEngine {
             return new CodeSearchResult("java", matches, false, e.getMessage());
         }
 
+        if (CancellationContext.isCancelled()) {
+            return new CodeSearchResult("java", matches, true, "Java 搜索已取消或超过 Deadline");
+        }
+
         boolean partial = matches.size() >= request.maxResults() || headLimited[0];
         String partialReason = matches.size() >= request.maxResults()
                 ? "已达到 max_results=" + request.maxResults()
@@ -99,6 +114,9 @@ final class JavaCodeSearchEngine implements CodeSearchEngine {
             List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
             String fileKey = relative.toString();
             for (int i = 0; i < lines.size() && matches.size() < request.maxResults(); i++) {
+                if (CancellationContext.isCancelled()) {
+                    return;
+                }
                 int currentFileMatches = perFileMatches.getOrDefault(fileKey, 0);
                 if (currentFileMatches >= request.headLimit()) {
                     if (contentPattern.matcher(lines.get(i)).find()) {

@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.paicli.llm.LlmClient;
 import com.paicli.llm.LlmTraceLogger;
+import com.paicli.context.RequestContextBudget;
+import com.paicli.context.RequestContextEstimator;
 import com.paicli.prompt.PromptAssembler;
 import com.paicli.prompt.PromptContext;
 import com.paicli.prompt.PromptMode;
@@ -54,6 +56,9 @@ public class Planner {
 
         // 调用LLM生成计划
         PlanningStreamRenderer streamRenderer = new PlanningStreamRenderer(out);
+        RequestContextBudget requestBudget = RequestContextEstimator.forClient(llmClient)
+                .validate(messages, null);
+        log.info("LLM request context [planner]: {}", requestBudget.diagnosticText());
         LlmClient.ChatResponse response = llmClient.chat(messages, null, streamRenderer);
         LlmTraceLogger.logReasoning(log, "planner", llmClient, response.reasoningContent());
         streamRenderer.finish();

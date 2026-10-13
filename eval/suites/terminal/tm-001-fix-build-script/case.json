@@ -1,0 +1,12 @@
+{
+  "id": "tm-001-fix-build-script",
+  "suite": "terminal",
+  "sandbox": "docker",
+  "workspace": { "fixture": "fixture" },
+  "prompt": "构建脚本坏了：README 和 CI 都假设 `sh build.sh` 之后能用 `java -cp out Main` 跑起来，但现在跑不通。请修好 build.sh，不要改 src/Main.java。",
+  "timeout_seconds": 900,
+  "graders": [
+    { "type": "command", "name": "build_and_run", "cmd": "rm -rf out build && sh build.sh && java -cp out Main" },
+    { "type": "output_assert", "name": "explains_fix", "regex": "(?i)(build|out|javac|目录)" }
+  ]
+}

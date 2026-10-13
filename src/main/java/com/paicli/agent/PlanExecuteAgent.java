@@ -3,20 +3,30 @@ package com.paicli.agent;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.paicli.llm.LlmClient;
+import com.paicli.llm.LlmCancelledException;
+import com.paicli.llm.LlmTimeoutException;
 import com.paicli.llm.LlmTraceLogger;
+import com.paicli.context.ContextViewBuildException;
+import com.paicli.context.RequestContextBudget;
+import com.paicli.context.RequestContextEstimator;
 import com.paicli.lsp.LspDiagnosticReport;
 import com.paicli.memory.ConversationHistoryCompactor;
+import com.paicli.memory.HistoryProjectionResult;
+import com.paicli.memory.HistoryProjectionState;
 import com.paicli.memory.MemoryManager;
 import com.paicli.plan.*;
 import com.paicli.prompt.PromptAssembler;
 import com.paicli.prompt.PromptContext;
 import com.paicli.prompt.PromptMode;
 import com.paicli.runtime.CancellationContext;
+import com.paicli.runtime.CancellationToken;
+import com.paicli.runtime.ResilienceConfig;
 import com.paicli.skill.SkillContextBuffer;
 import com.paicli.skill.SkillIndexFormatter;
 import com.paicli.skill.SkillRegistry;
 import com.paicli.util.AnsiStyle;
 import com.paicli.tool.ToolRegistry;
+import com.paicli.tool.ToolResultAccumulator;
 import com.paicli.tool.ToolRegistry.ToolExecutionResult;
 import com.paicli.tool.ToolRegistry.ToolInvocation;
 import com.paicli.util.TerminalMarkdownRenderer;
@@ -73,6 +83,9 @@ public class PlanExecuteAgent {
         boolean failed() {
             return error != null;
         }
+    }
+
+    private record PendingTask(Task task, CancellationToken token, Future<TaskExecutionResult> future) {
     }
 
     public interface PlanReviewHandler {
@@ -181,17 +194,50 @@ public class PlanExecuteAgent {
         this.skillContextBuffer = skillContextBuffer;
     }
 
-    private void maybeCompactHistory(List<LlmClient.Message> messages, PrintStream out) {
-        if (historyCompactor == null) return;
-        int trigger = memoryManager.getContextProfile().compressionTriggerTokens();
+    private PreparedTaskRequest prepareHistoryRequest(List<LlmClient.Message> messages,
+                                                      HistoryProjectionState state,
+                                                      List<LlmClient.Tool> tools,
+                                                      PrintStream out)
+            throws ContextViewBuildException {
+        RequestContextEstimator estimator = new RequestContextEstimator(
+                llmClient, memoryManager.getContextProfile());
         try {
-            boolean compacted = historyCompactor.compactIfNeeded(messages, trigger);
-            if (compacted && out != null) {
+            HistoryProjectionResult projection = historyCompactor.project(
+                    messages,
+                    state,
+                    estimator,
+                    tools,
+                    toolRegistry.getToolResultArtifactIndex());
+            RequestContextBudget budget = estimator.validate(projection.modelMessages(), tools);
+            if (projection.checkpointAdvanced() && out != null) {
                 out.println("📦 上下文接近窗口上限，已把早期对话压缩为摘要后继续。");
             }
+            return new PreparedTaskRequest(projection, budget);
+        } catch (ContextViewBuildException e) {
+            throw e;
         } catch (Exception e) {
-            log.warn("conversationHistory compaction failed", e);
+            log.warn("plan task history projection failed; using immutable source snapshot", e);
+            List<LlmClient.Message> sourceSnapshot = List.copyOf(messages);
+            int tokens = com.paicli.memory.TokenBudget.estimateMessagesTokens(sourceSnapshot);
+            HistoryProjectionResult fallback = new HistoryProjectionResult(
+                    sourceSnapshot,
+                    state,
+                    false,
+                    false,
+                    0,
+                    0,
+                    "",
+                    tokens,
+                    tokens,
+                    true);
+            return new PreparedTaskRequest(
+                    fallback,
+                    estimator.validate(fallback.modelMessages(), tools));
         }
+    }
+
+    private record PreparedTaskRequest(HistoryProjectionResult projection,
+                                       RequestContextBudget budget) {
     }
 
     private String buildSkillIndex() {
@@ -217,12 +263,18 @@ public class PlanExecuteAgent {
      * 运行任务（自动判断是否需要规划）
      */
     public String run(String userInput) {
+        try (CancellationContext.RunLease ignored = CancellationContext.openRun()) {
+            return runWithinContext(userInput);
+        }
+    }
+
+    private String runWithinContext(String userInput) {
         log.info("Plan run started: inputLength={}", userInput == null ? 0 : userInput.length());
         memoryManager.addUserMessage(userInput);
         StreamState streamState = new StreamState();
         try {
             if (CancellationContext.isCancelled()) {
-                return "⏹️ 已取消当前计划执行。";
+                return CancellationContext.stopMessage("当前计划执行");
             }
             PlanRunOutcome outcome = runWithPlan(userInput, streamState);
             if (outcome.persistAssistantMessage() && outcome.result() != null && !outcome.result().isBlank()) {
@@ -232,6 +284,13 @@ public class PlanExecuteAgent {
                 return "";
             }
             return outcome.result();
+        } catch (LlmTimeoutException e) {
+            log.warn("Plan run timed out: phase={}", e.phase());
+            String errorMessage = "⏱️ 计划执行超时（" + e.phase() + "）: " + e.getMessage();
+            memoryManager.addAssistantMessage(errorMessage);
+            return errorMessage;
+        } catch (LlmCancelledException e) {
+            return "⏹️ 已取消当前计划执行。";
         } catch (Exception e) {
             log.error("Plan run failed", e);
             String errorMessage = "❌ 执行失败: " + e.getMessage();
@@ -256,6 +315,7 @@ public class PlanExecuteAgent {
             }
 
             if (decision.action() == PlanReviewAction.CANCEL) {
+                plan.markCancelled();
                 return PlanRunOutcome.canceled("⏹️ 已取消本次计划执行。");
             }
 
@@ -279,7 +339,12 @@ public class PlanExecuteAgent {
 
         while (true) {
             if (CancellationContext.isCancelled()) {
-                return "⏹️ 已取消当前计划执行。";
+                if (CancellationContext.isDeadlineExceeded()) {
+                    plan.markFailed();
+                } else {
+                    plan.markCancelled();
+                }
+                return CancellationContext.stopMessage("当前计划执行");
             }
             List<Task> executableTasks = getExecutableTasksInOrder(plan);
             if (executableTasks.isEmpty()) {
@@ -287,6 +352,24 @@ public class PlanExecuteAgent {
             }
 
             List<TaskExecutionResult> batchResults = executeTaskBatch(plan, executableTasks, streamState);
+            if (CancellationContext.isCancelled()) {
+                boolean timedOut = CancellationContext.isDeadlineExceeded();
+                for (Task task : executableTasks) {
+                    if (task.getStatus() == Task.TaskStatus.RUNNING) {
+                        if (timedOut) {
+                            task.markFailed("任务超过 Deadline");
+                        } else {
+                            task.markSkipped();
+                        }
+                    }
+                }
+                if (timedOut) {
+                    plan.markFailed();
+                } else {
+                    plan.markCancelled();
+                }
+                return CancellationContext.stopMessage("当前计划执行");
+            }
             for (TaskExecutionResult batchResult : batchResults) {
                 Task task = batchResult.task();
 
@@ -309,7 +392,10 @@ public class PlanExecuteAgent {
                 log.warn("Task failed: {} error={}", task.getId(), error.getMessage());
                 out.println("❌ 失败 [" + task.getId() + "]: " + error.getMessage() + "\n");
 
-                if (plan.getProgress() < 0.5) {
+                boolean timeoutFailure = error instanceof LlmTimeoutException
+                        || error instanceof TimeoutException
+                        || error instanceof ContextViewBuildException;
+                if (!timeoutFailure && plan.getProgress() < 0.5) {
                     out.println("🔄 尝试重新规划...\n");
                     ExecutionPlan replanned = planner.replan(plan, error.getMessage());
                     return reviewAndExecutePlan(replanned, streamState).result();
@@ -359,17 +445,15 @@ public class PlanExecuteAgent {
 
     private List<TaskExecutionResult> executeTaskBatch(ExecutionPlan plan, List<Task> executableTasks,
                                                        StreamState streamState) {
+        long stepDeadlineMillis = ResilienceConfig.current().stepDeadlineMillis();
         if (executableTasks.size() == 1) {
             Task task = executableTasks.get(0);
             log.info("Executing single task: {} type={}", task.getId(), task.getType());
             out.println("▶️ 执行任务 [" + task.getId() + "]: " + task.getDescription());
             task.markStarted();
 
-            try {
-                return List.of(TaskExecutionResult.success(task, executeTask(plan.getGoal(), plan, task, streamState, out)));
-            } catch (Exception e) {
-                return List.of(TaskExecutionResult.failure(task, e));
-            }
+            CancellationToken token = CancellationContext.childToken(stepDeadlineMillis);
+            return List.of(executeTaskWithinDeadline(plan, task, streamState, out, token));
         }
 
         String parallelTaskIds = executableTasks.stream()
@@ -385,35 +469,54 @@ public class PlanExecuteAgent {
         });
         try {
             Map<String, ByteArrayOutputStream> buffers = new LinkedHashMap<>();
-            List<Future<TaskExecutionResult>> futures = new ArrayList<>();
+            List<PendingTask> pendingTasks = new ArrayList<>();
             for (Task task : executableTasks) {
                 out.println("▶️ 并行任务 [" + task.getId() + "]: " + task.getDescription());
                 task.markStarted();
                 ByteArrayOutputStream baos = new ByteArrayOutputStream();
                 buffers.put(task.getId(), baos);
                 PrintStream taskOut = new PrintStream(baos, true, StandardCharsets.UTF_8);
-                futures.add(executor.submit(() -> {
-                    try {
-                        return TaskExecutionResult.success(task, executeTask(plan.getGoal(), plan, task, streamState, taskOut));
-                    } catch (Exception e) {
-                        return TaskExecutionResult.failure(task, e);
-                    }
-                }));
+                CancellationToken token = CancellationContext.childToken(stepDeadlineMillis);
+                Future<TaskExecutionResult> future = executor.submit(
+                        () -> executeTaskWithinDeadline(plan, task, streamState, taskOut, token));
+                pendingTasks.add(new PendingTask(task, token, future));
             }
 
             List<TaskExecutionResult> results = new ArrayList<>();
-            for (Future<TaskExecutionResult> future : futures) {
+            for (PendingTask pending : pendingTasks) {
+                if (CancellationContext.isCancelled()) {
+                    cancelPendingTasks(pendingTasks, CancellationContext.isDeadlineExceeded());
+                }
+                if (pending.token().isCancelled()) {
+                    pending.future().cancel(true);
+                    Exception stopped = pending.token().isDeadlineExceeded()
+                            ? new TimeoutException("任务 [" + pending.task().getId() + "] 超过步骤 Deadline")
+                            : new CancellationException("任务 [" + pending.task().getId() + "] 已取消");
+                    results.add(TaskExecutionResult.failure(pending.task(), stopped));
+                    continue;
+                }
                 try {
-                    results.add(future.get());
+                    long waitMillis = Math.min(
+                            CancellationContext.remainingMillis(stepDeadlineMillis, 0),
+                            pending.token().remainingMillis());
+                    if (waitMillis <= 0) {
+                        throw new TimeoutException("Plan task Deadline exhausted");
+                    }
+                    results.add(pending.future().get(waitMillis, TimeUnit.MILLISECONDS));
+                } catch (TimeoutException e) {
+                    cancelPendingTasks(pendingTasks, true);
+                    results.add(TaskExecutionResult.failure(pending.task(),
+                            new TimeoutException("任务 [" + pending.task().getId() + "] 超过步骤 Deadline")));
                 } catch (InterruptedException e) {
+                    cancelPendingTasks(pendingTasks, CancellationContext.isDeadlineExceeded());
                     Thread.currentThread().interrupt();
-                    results.add(TaskExecutionResult.failure(executableTasks.get(results.size()), e));
+                    results.add(TaskExecutionResult.failure(pending.task(), e));
                 } catch (ExecutionException e) {
                     Throwable cause = e.getCause();
                     Exception error = cause instanceof Exception exception
                             ? exception
                             : new RuntimeException(cause);
-                    results.add(TaskExecutionResult.failure(executableTasks.get(results.size()), error));
+                    results.add(TaskExecutionResult.failure(pending.task(), error));
                 }
             }
 
@@ -429,6 +532,41 @@ public class PlanExecuteAgent {
             return results;
         } finally {
             executor.shutdownNow();
+        }
+    }
+
+    private static void cancelPendingTasks(List<PendingTask> pendingTasks, boolean timedOut) {
+        for (PendingTask pending : pendingTasks) {
+            if (pending.future().isDone()) {
+                continue;
+            }
+            if (timedOut) {
+                pending.token().timeout();
+                pending.task().markFailed("任务超过步骤 Deadline");
+            } else {
+                pending.token().cancel();
+                pending.task().markSkipped();
+            }
+            pending.future().cancel(true);
+        }
+    }
+
+    private TaskExecutionResult executeTaskWithinDeadline(ExecutionPlan plan, Task task,
+                                                          StreamState streamState, PrintStream taskOut,
+                                                          CancellationToken token) {
+        try (token; CancellationContext.Scope ignored = CancellationContext.bind(token)) {
+            TaskRunResult result = executeTask(plan.getGoal(), plan, task, streamState, taskOut);
+            if (token.isDeadlineExceeded()) {
+                return TaskExecutionResult.failure(task,
+                        new TimeoutException("任务 [" + task.getId() + "] 超过步骤 Deadline"));
+            }
+            if (token.isCancelled()) {
+                return TaskExecutionResult.failure(task,
+                        new CancellationException("任务 [" + task.getId() + "] 已取消"));
+            }
+            return TaskExecutionResult.success(task, result);
+        } catch (Exception e) {
+            return TaskExecutionResult.failure(task, e);
         }
     }
 
@@ -462,8 +600,11 @@ public class PlanExecuteAgent {
                         taskInput,
                         Path.of(toolRegistry.getProjectPath()))
         ));
+        // Task-local by design: images and projection checkpoints are discarded with this task.
+        HistoryProjectionState projectionState = HistoryProjectionState.empty();
 
-        StringBuilder allResults = new StringBuilder();
+        ToolResultAccumulator allResults = new ToolResultAccumulator(
+                toolRegistry.getToolResultManifestHandle());
         int iteration = 0;
         TaskStreamRenderer streamRenderer = new TaskStreamRenderer(task.getId(), streamState, out);
 
@@ -474,17 +615,25 @@ public class PlanExecuteAgent {
         while (iteration < MAX_TASK_ITERATIONS) {
             if (CancellationContext.isCancelled()) {
                 streamRenderer.finish();
-                return TaskRunResult.of("⏹️ 已取消任务 [" + task.getId() + "]。", streamRenderer.hasStreamedOutput());
+                return TaskRunResult.of(CancellationContext.stopMessage("任务 [" + task.getId() + "]"),
+                        streamRenderer.hasStreamedOutput());
             }
             iteration++;
 
-            // 调 LLM 前评估 messages 是否接近 window 上限；超阈值压缩早期消息为摘要。
+            // Keep task source messages intact and derive only the immutable request view.
             injectPendingLspDiagnostics(messages, out);
-            maybeCompactHistory(messages, out);
+            List<LlmClient.Tool> toolDefinitions = toolRegistry.getToolDefinitions();
+            PreparedTaskRequest prepared = prepareHistoryRequest(
+                    messages, projectionState, toolDefinitions, out);
+            HistoryProjectionResult projection = prepared.projection();
+            projectionState = projection.nextState();
+
+            log.info("LLM request context [plan-task task={} iteration={}]: {}",
+                    task.getId(), iteration, prepared.budget().diagnosticText());
 
             LlmClient.ChatResponse response = llmClient.chat(
-                    messages,
-                    toolRegistry.getToolDefinitions(),
+                    projection.modelMessages(),
+                    toolDefinitions,
                     streamRenderer
             );
             LlmTraceLogger.logReasoning(log,
@@ -493,7 +642,8 @@ public class PlanExecuteAgent {
                     response.reasoningContent());
             if (CancellationContext.isCancelled()) {
                 streamRenderer.finish();
-                return TaskRunResult.of("⏹️ 已取消任务 [" + task.getId() + "]。", streamRenderer.hasStreamedOutput());
+                return TaskRunResult.of(CancellationContext.stopMessage("任务 [" + task.getId() + "]"),
+                        streamRenderer.hasStreamedOutput());
             }
 
             totalInputTokens += response.inputTokens();
@@ -510,7 +660,7 @@ public class PlanExecuteAgent {
             if (!response.hasToolCalls()) {
                 memoryManager.recordTokenUsage(totalInputTokens, totalOutputTokens, totalCachedInputTokens);
                 if (!allResults.isEmpty() && (response.content() == null || response.content().isBlank())) {
-                    String toolOnlyResult = allResults.toString().trim();
+                    String toolOnlyResult = allResults.build().trim();
                     if (!toolOnlyResult.isBlank()) {
                         memoryManager.addAssistantMessage("[计划任务 " + task.getId() + "] " + toolOnlyResult);
                     }
@@ -539,13 +689,13 @@ public class PlanExecuteAgent {
             List<ToolExecutionResult> toolResults = executeToolCalls(task.getId(), response.toolCalls());
             for (ToolExecutionResult toolResult : toolResults) {
                 memoryManager.addToolResult(toolResult.name(), toolResult.result());
-                allResults.append(toolResult.result()).append("\n");
+                allResults.add(toolResult);
                 messages.add(LlmClient.Message.tool(toolResult.id(), toolResult.result()));
             }
             appendImageToolMessages(messages, toolResults);
         }
 
-        String fallbackResult = allResults.toString().trim();
+        String fallbackResult = allResults.build().trim();
         if (!fallbackResult.isBlank()) {
             memoryManager.addAssistantMessage("[计划任务 " + task.getId() + "] " + fallbackResult);
         }
@@ -602,7 +752,8 @@ public class PlanExecuteAgent {
         }
         List<ToolExecutionResult> results = toolRegistry.executeTools(invocations);
         for (ToolExecutionResult result : results) {
-            log.debug("Task {} tool result preview [{}]: {}", taskId, result.name(), preview(result.result(), 300));
+            log.debug("Task {} tool result [{}]: {}", taskId, result.name(),
+                    preview(result.observabilitySummary(), 500));
         }
         return results;
     }

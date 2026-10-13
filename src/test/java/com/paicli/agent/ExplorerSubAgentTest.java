@@ -25,7 +25,8 @@ class ExplorerSubAgentTest {
 
         ToolRegistry view = main.readOnlyExploreView();
 
-        for (String tool : List.of("glob_files", "grep_code", "read_file", "list_dir", "search_code")) {
+        for (String tool : List.of(
+                "glob_files", "grep_code", "read_file", "list_dir", "search_code", "read_tool_result")) {
             assertTrue(view.hasTool(tool), "只读视图应保留只读检索工具 " + tool);
         }
         for (String tool : List.of("write_file", "execute_command", "create_project", "revert_turn", "explore_codebase")) {

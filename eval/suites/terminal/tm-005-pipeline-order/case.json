@@ -1,0 +1,13 @@
+{
+  "id": "tm-005-pipeline-order",
+  "suite": "terminal",
+  "sandbox": "docker",
+  "workspace": { "fixture": "fixture" },
+  "prompt": "这里有两个脚本 generate.sh 和 summarize.sh。请把整条流水线跑通，最终产出 data/summary.txt。另外写一个 pipeline.sh，让以后只跑 `sh pipeline.sh` 就能从零复现这个结果（先清掉 data 目录再重跑）。不要修改这两个已有脚本。",
+  "timeout_seconds": 900,
+  "graders": [
+    { "type": "file_assert", "name": "summary_produced", "path": "data/summary.txt", "regex": "(?s)alpha.*bravo.*charlie.*delta.*echo.*COUNT 5" },
+    { "type": "command", "name": "pipeline_reproduces", "cmd": "rm -rf data && sh pipeline.sh && grep -q '^COUNT 5$' data/summary.txt" },
+    { "type": "file_assert", "name": "generate_untouched", "path": "generate.sh", "contains": "tr ',' '\\n' < seed.csv" }
+  ]
+}

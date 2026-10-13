@@ -106,6 +106,7 @@ public final class ToolCallRenderer {
             case "search_code" -> "🔍 搜索代码 " + count + " 次";
             case "web_search" -> "🌐 联网搜索 " + count + " 次";
             case "web_fetch" -> "📰 抓取 " + count + " 个网页";
+            case "read_tool_result" -> "📦 读取 " + count + " 个工具结果分片";
             case "save_memory" -> "💾 保存长期记忆 " + count + " 条";
             default -> toolName != null && toolName.startsWith("mcp__")
                     ? formatMcpLabel(toolName, count)
@@ -128,6 +129,7 @@ public final class ToolCallRenderer {
             case "web_fetch" -> "📰 WebFetch(" + compactUrl(detail) + ")";
             case "search_code" -> "🔍 SearchCode(\"" + detail + "\")";
             case "read_file" -> "📖 ReadFile(" + detail + ")";
+            case "read_tool_result" -> "📦 ReadToolResult(" + detail + ")";
             case "list_dir" -> "📂 ListDir(" + detail + ")";
             case "execute_command" -> "⚡ Shell(" + detail + ")";
             default -> label + " · " + detail;
@@ -151,6 +153,7 @@ public final class ToolCallRenderer {
                 case "create_project" -> "name";
                 case "search_code", "web_search" -> "query";
                 case "web_fetch" -> "url";
+                case "read_tool_result" -> "handle";
                 case "save_memory" -> "fact";
                 default -> null;
             };

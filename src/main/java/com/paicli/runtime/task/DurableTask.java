@@ -16,6 +16,7 @@ public record DurableTask(
     public boolean terminal() {
         return status == TaskStatus.COMPLETED
                 || status == TaskStatus.FAILED
+                || status == TaskStatus.TIMED_OUT
                 || status == TaskStatus.CANCELED;
     }
 

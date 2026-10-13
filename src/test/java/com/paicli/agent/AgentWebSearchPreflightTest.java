@@ -2,6 +2,7 @@ package com.paicli.agent;
 
 import com.paicli.llm.LlmClient;
 import com.paicli.tool.ToolRegistry;
+import com.paicli.tool.ToolResultArtifactStore;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -22,7 +23,9 @@ class AgentWebSearchPreflightTest {
         RecordingClient llm = new RecordingClient(List.of(
                 new LlmClient.ChatResponse("assistant", "基于联网结果回答。", null, 20, 5)
         ));
-        RecordingToolRegistry registry = new RecordingToolRegistry();
+        RecordingToolRegistry registry = new RecordingToolRegistry(
+                new ToolResultArtifactStore(tempDir.resolve("artifacts"), tempDir, 4_096, 7),
+                "联网结果：MCP A2A Agents SDK LangGraph");
         registry.setProjectPath(tempDir.toString());
         Agent agent = new Agent(llm, registry);
 
@@ -43,7 +46,9 @@ class AgentWebSearchPreflightTest {
         RecordingClient llm = new RecordingClient(List.of(
                 new LlmClient.ChatResponse("assistant", "离线回答。", null, 20, 5)
         ));
-        RecordingToolRegistry registry = new RecordingToolRegistry();
+        RecordingToolRegistry registry = new RecordingToolRegistry(
+                new ToolResultArtifactStore(tempDir.resolve("artifacts"), tempDir, 4_096, 7),
+                "联网结果：MCP A2A Agents SDK LangGraph");
         registry.setProjectPath(tempDir.toString());
         Agent agent = new Agent(llm, registry);
 
@@ -52,16 +57,48 @@ class AgentWebSearchPreflightTest {
         assertEquals(0, registry.webSearchCalls);
     }
 
+    @Test
+    void projectsLargeFreshnessResultBeforeItEntersFirstLlmRequest(@TempDir Path tempDir) {
+        RecordingClient llm = new RecordingClient(List.of(
+                new LlmClient.ChatResponse("assistant", "done", null, 20, 5)
+        ));
+        String raw = "FRESHNESS-RAW-" + "x".repeat(100_000);
+        RecordingToolRegistry registry = new RecordingToolRegistry(
+                new ToolResultArtifactStore(tempDir.resolve("large-artifacts"), tempDir, 1, 7), raw);
+        registry.setProjectPath(tempDir.toString());
+        Agent agent = new Agent(llm, registry);
+
+        agent.run("2026 年最新 AI Agent 技术趋势有哪些？");
+
+        String preflight = llm.messagesByCall.get(0).stream()
+                .filter(message -> "user".equals(message.role()))
+                .map(LlmClient.Message::content)
+                .filter(content -> content.contains("## 联网预检结果"))
+                .findFirst()
+                .orElseThrow();
+        assertTrue(preflight.contains("[工具结果已落盘]"));
+        assertTrue(preflight.contains("tool-result://"));
+        assertTrue(preflight.length() < 10_000);
+        assertTrue(!preflight.contains(raw));
+        assertEquals(1, registry.webSearchCalls);
+    }
+
     private static final class RecordingToolRegistry extends ToolRegistry {
         private int webSearchCalls;
         private String lastArguments = "";
+        private final String searchResult;
+
+        private RecordingToolRegistry(ToolResultArtifactStore store, String searchResult) {
+            super(store);
+            this.searchResult = searchResult;
+        }
 
         @Override
         public String executeTool(String name, String argumentsJson) {
             if ("web_search".equals(name)) {
                 webSearchCalls++;
                 lastArguments = argumentsJson;
-                return "联网结果：MCP A2A Agents SDK LangGraph";
+                return searchResult;
             }
             return super.executeTool(name, argumentsJson);
         }

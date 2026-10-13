@@ -263,6 +263,7 @@ public final class PlainRenderer implements Renderer {
             case "search_code" -> "🔍 搜索代码 " + count + " 次";
             case "web_search" -> "🌐 联网搜索 " + count + " 次";
             case "web_fetch" -> "📰 抓取 " + count + " 个网页";
+            case "read_tool_result" -> "📦 读取 " + count + " 个工具结果分片";
             case "save_memory" -> "💾 保存长期记忆 " + count + " 条";
             default -> toolName != null && toolName.startsWith("mcp__")
                     ? formatMcpLabel(toolName, count)
@@ -287,6 +288,7 @@ public final class PlainRenderer implements Renderer {
                 case "create_project" -> "name";
                 case "search_code", "web_search" -> "query";
                 case "web_fetch" -> "url";
+                case "read_tool_result" -> "handle";
                 case "save_memory" -> "fact";
                 default -> null;
             };

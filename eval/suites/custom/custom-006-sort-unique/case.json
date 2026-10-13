@@ -1,0 +1,11 @@
+{
+  "id": "custom-006-sort-unique",
+  "suite": "custom",
+  "workspace": { "fixture": "fixture" },
+  "prompt": "读取 input.txt，在工作区根目录生成 result.txt：内容为去重后按字典序升序排列的单词，每行一个，不要有多余内容。不要修改 input.txt。",
+  "timeout_seconds": 300,
+  "graders": [
+    { "type": "file_assert", "name": "result_sorted", "path": "result.txt", "regex": "(?s)^\\s*apple\\s+banana\\s+cherry\\s+date\\s*$" },
+    { "type": "file_assert", "name": "input_untouched", "path": "input.txt", "contains": "banana" }
+  ]
+}

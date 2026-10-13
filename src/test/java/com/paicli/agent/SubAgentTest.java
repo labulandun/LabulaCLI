@@ -3,13 +3,17 @@ package com.paicli.agent;
 import com.paicli.llm.GLMClient;
 import com.paicli.llm.LlmClient;
 import com.paicli.tool.ToolRegistry;
+import com.paicli.tool.ToolResultArtifactStore;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Consumer;
 
@@ -138,6 +142,49 @@ class SubAgentTest {
         assertTrue(output.contains("答案"), "content should still appear");
     }
 
+    @Test
+    void workerFeedsOnlyArtifactEnvelopeIntoNextLlmIteration(@TempDir Path tempDir) {
+        String raw = "WORKER-RAW-" + "x".repeat(100_000);
+        ToolRegistry registry = new ToolRegistry(new ToolResultArtifactStore(
+                tempDir.resolve("artifacts"), tempDir, 1, 7)) {
+            @Override
+            public String executeTool(String name, String argumentsJson) {
+                if ("large_worker_tool".equals(name)) {
+                    return raw;
+                }
+                return super.executeTool(name, argumentsJson);
+            }
+        };
+        registry.setProjectPath(tempDir.toString());
+        MultiCallStreamClient llm = new MultiCallStreamClient(List.of(
+                new CallScript(listener -> { }, new LlmClient.ChatResponse(
+                        "assistant",
+                        "",
+                        null,
+                        List.of(new LlmClient.ToolCall(
+                                "call_worker",
+                                new LlmClient.ToolCall.Function("large_worker_tool", "{}"))),
+                        10,
+                        5)),
+                new CallScript(listener -> { }, new LlmClient.ChatResponse(
+                        "assistant", "worker done", null, null, 10, 5))
+        ));
+        SubAgent worker = new SubAgent("worker", AgentRole.WORKER, llm, registry);
+
+        worker.execute(AgentMessage.task("orchestrator", "run large tool"),
+                new PrintStream(new ByteArrayOutputStream()));
+
+        String toolMessage = llm.messagesByCall.get(1).stream()
+                .filter(message -> "tool".equals(message.role()))
+                .map(LlmClient.Message::content)
+                .findFirst()
+                .orElseThrow();
+        assertTrue(toolMessage.contains("[工具结果已落盘]"));
+        assertTrue(toolMessage.contains("tool-result://"));
+        assertTrue(toolMessage.length() < 10_000);
+        assertFalse(toolMessage.contains(raw));
+    }
+
     private boolean invokeShouldUseTools(SubAgent agent) throws Exception {
         Method method = SubAgent.class.getDeclaredMethod("shouldUseTools");
         method.setAccessible(true);
@@ -175,6 +222,7 @@ class SubAgentTest {
 
     private static final class MultiCallStreamClient extends GLMClient {
         private final java.util.Iterator<CallScript> iter;
+        private final List<List<Message>> messagesByCall = new ArrayList<>();
 
         private MultiCallStreamClient(List<CallScript> scripts) {
             super("test-key");
@@ -188,6 +236,7 @@ class SubAgentTest {
 
         @Override
         public ChatResponse chat(List<Message> messages, List<Tool> tools, StreamListener listener) throws IOException {
+            messagesByCall.add(List.copyOf(messages));
             if (!iter.hasNext()) {
                 throw new IOException("脚本已耗尽，未预设第 N 次调用");
             }

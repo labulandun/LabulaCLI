@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Map;
 import java.util.List;
 
 public interface LlmClient {
@@ -26,6 +28,20 @@ public interface LlmClient {
 
     default String promptCacheMode() {
         return "none";
+    }
+
+    /** Whether assistant reasoning content is serialized again in later request history. */
+    default boolean replaysReasoningContent() {
+        return false;
+    }
+
+    /**
+     * Provider-specific top-level request fields that are sent in addition to model/stream,
+     * messages and tools. Phase 90.3 exposes them so wire construction and request accounting
+     * use the same source of truth.
+     */
+    default Map<String, Object> requestEnvelopeFields() {
+        return Map.of();
     }
 
     record ContentPart(String type, String text, String imageBase64, String imageUrl, String mimeType) {
@@ -53,6 +69,11 @@ public interface LlmClient {
 
     record Message(String role, String content, String reasoningContent, List<ToolCall> toolCalls,
                    String toolCallId, List<ContentPart> contentParts) {
+        public Message {
+            toolCalls = immutableCopy(toolCalls);
+            contentParts = immutableCopy(contentParts);
+        }
+
         public Message(String role, String content, String reasoningContent, List<ToolCall> toolCalls,
                        String toolCallId) {
             this(role, content, reasoningContent, toolCalls, toolCallId, null);
@@ -170,6 +191,12 @@ public interface LlmClient {
                 sb.append("[已附加 ").append(imageCount).append(" 张图片]");
             }
             return sb.toString();
+        }
+
+        private static <T> List<T> immutableCopy(List<T> values) {
+            return values == null
+                    ? null
+                    : Collections.unmodifiableList(new ArrayList<>(values));
         }
     }
 

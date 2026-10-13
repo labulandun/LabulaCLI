@@ -255,7 +255,7 @@
   - `resources/list_changed` / `resources/updated` → cache 失效
   - **不做 health ping**，不主动探活，避免对按量或按月计费 server 造成额外负担
 - **新增 CLI**：`/mcp resources <server>`、`/mcp prompts <server>`
-- **运行中取消**：任务执行期间输入 `/cancel` 并回车，请求取消当前 Agent run；ReAct、Plan、Team、工具批次与 `execute_command` 在边界处协同检查取消信号
+- **运行中取消**：任务执行期间输入 `/cancel` 并回车，请求取消当前 Agent run；ReAct、Plan、Team、工具和 MCP 共享 Deadline/取消信号，在途 LLM/HTTP MCP Call、命令进程与子 Future 会主动终止，pending MCP request 会发送 `notifications/cancelled`
 
 **不做（明确边界）**：
 - OAuth 2.0 Authorization Code + PKCE
@@ -277,11 +277,13 @@
 
 ---
 
-## 第12期：长上下文工程（适配 200k–1M 模型 + prompt caching） ✅
+## 第12期：长上下文工程（适配 200k–1M 模型 + prompt caching） ✅（历史交付快照）
+
+> 本节记录 Phase 12 当时的目标和验收，不代表当前运行时口径。short/balanced/long 三档、long 跳过摘要、按模式选择 RAG topK 和 `80% × window` 预算均已被 Phase 90 取代；Claude Sonnet 4.6 是当时的适配目标，不是当前内置 provider。现行行为见下方“长上下文改进 Phase 90.1–90.3”。
 
 **目标**：适配 GLM-5.1（200k）/ DeepSeek V4（1M）/ StepFun（256k）/ Kimi K2.6（256k）/ Claude Sonnet 4.6（1M）等长上下文模型。第 3 期 Memory 是基于"短上下文兜底"假设设计的，长窗口下要切换策略。
 
-**功能迭代**（详细开发任务见 `docs/phase-12-long-context.md`）：
+**当时的功能迭代**（详细开发任务见 `docs/phase-12-long-context.md`）：
 - `LlmClient` 接口扩展能力声明：`maxContextWindow()` / `supportsPromptCaching()` / `promptCacheMode()`
 - `ContextProfile` 统一管理 short / balanced / long 三种上下文模式
 - `AgentBudget` token 预算从写死 300K 改为按当前模型动态计算（默认 80% × maxContextWindow，仍支持系统属性覆盖）
@@ -303,7 +305,7 @@
 - RAG 在长上下文时代的角色变化（从"压缩选择"到"加速 + 精排"）
 - 资源索引（MCP resources URI + 描述）作为长上下文的有效填充
 
-**验证**：`mvn test` 347 tests 通过；`mvn clean package` 通过
+**当时验证**：`mvn test` 347 tests 通过；`mvn clean package` 通过
 
 ---
 
@@ -461,18 +463,19 @@
 **目标**：Agent 每次 turn 前后自动做 workspace 快照，用户可以一键回滚到任意 turn 之前的状态，不污染用户的 `.git` 历史。对标 DeepSeek TUI 的 `snapshot/` 系统。
 
 **功能迭代**：
-- `SideGitManager`：在 `~/.paicli/snapshots/<project_hash>/<worktree_hash>/.git` 维护独立 side-git 仓库，通过 JGit 纯 Java 实现，与用户的工作区 `.git` 完全隔离
-- `preTurnSnapshot()`：每个 turn 开始前，对 workspace 执行 JGit add/commit 并标记 `"pre-turn <turn_id>"`；MVP 采用同步 pre 快照，确保 Agent 改文件前已经保存基线
+- `SideGitManager`：在 `~/.paicli/snapshots/<project_hash>/<worktree_hash>/.git` 维护 bare side-git 仓库，通过 JGit 对象 API 构建快照，与用户的工作区 `.git` 完全隔离
+- `preTurnSnapshot()`：每个 turn 开始前扫描 workspace，通过 blob/tree/commit 对象写入 `refs/paicli/snapshots/history` 并标记 `"pre-turn <turn_id>"`；采用同步 pre 快照，确保 Agent 改文件前已经保存基线
 - `postTurnSnapshot()`：turn 结束后异步执行第二次快照，commit message 标记 `"post-turn <turn_id>"`
 - `/restore <N>` 命令：从最近 N 个 turn 的 pre-turn 快照中恢复文件到工作区，不改变用户 `.git` 和对话历史
 - `revert_turn` 工具：LLM 可调用的回滚工具，让 Agent 自己能判断"改坏了需要撤销"
-- 快照策略可配：`max_snapshots`（默认保留最近 50 个 turn）、`snapshot_excludes`（默认排除 `.git/`、`node_modules/`、`target/`）
+- 快照策略可配：`max_snapshots`（默认列表/定位最近 50 个快照，物理裁剪仍属后续增强）、`snapshot_excludes`（默认排除 `.git/`、`node_modules/`、`target/`）
+- 隔离保护：项目 `.git` 指向 PaiCLI 快照目录时禁用快照并报告迁移错误；清理目录与项目 GitDir 重叠时拒绝执行
 
 **设计参考**：DeepSeek TUI `crates/tui/src/core/engine.rs` 的 `pre_turn_snapshot()` / `post_turn_snapshot()` + `crates/tui/src/core/turn.rs` 的 `pre_tool_snapshot()`。
 
 **核心知识点**：
 - Git 内部对象模型（tree / commit / blob）与 JGit API
-- Side-git 仓库隔离技术（独立 `.git` 目录 + `--work-tree` 等价操作）
+- Side-git 仓库隔离技术（bare repo + JGit 对象写入 + `refs/paicli/snapshots/*`）
 - Turn 粒度的自动快照策略
 - 异步快照不阻塞主流程的 fire-and-forget 模式
 
@@ -522,7 +525,7 @@
 
 **后台任务（Task Manager）**：
 - `DurableTaskManager`：SQLite 持久化的任务队列，复用已有的 `VectorStore` SQLite 基础设施
-- 任务生命周期：`enqueued` → `running` → `completed` / `failed` / `canceled`
+- 任务生命周期：`enqueued` → `running` → `completed` / `failed` / `timed_out` / `canceled`
 - Worker Pool：可配并发数（默认 2），每个 Worker 启动独立 Agent 线程执行任务
 - `/task add <prompt>`：提交后台任务，返回 task_id
 - `/task list`：列出所有任务（含状态、耗时、进度）
@@ -602,6 +605,52 @@
 **估算**：5–6 天
 
 ---
+## 横向能力：长上下文改进 ✅ Phase 90.1–90.3
+
+- Phase 90.1 已交付：大文本工具结果在 `ToolRegistry` 顶层模型边界自动写为 UTF-8 工件；ReAct、Plan、Worker、freshness 预检与 nested Explore 的 history 只接收有界 preview + digest + manifest + opaque handle
+- `read_tool_result` 支持 session/project scope 校验、Unicode code-point 分页、SHA-256 完整性检查；读工具 spill-exempt，避免递归生成工件
+- Plan 工具 fallback 改为 24,000 code points 有界 accumulator；UI、partial 判断与 tracing 使用释放原文前生成的 bounded metadata/display preview
+- 默认 4,096 estimated tokens spill、32 MiB/工件、256 MiB/session、7 天留存；`/clear` 轮换 artifact session
+- Phase 90.2 已交付：`ConversationHistoryCompactor.project(...)` 从完整 source history 生成不可变 model view；ReAct、Plan task、Worker SubAgent 的业务 LLM 只接收该 view，摘要/ack 不反写 source
+- checkpoint 记录 covered boundary + 全字段 prefix digest，并绑定摘要 policy/provider/model/reasoning replay/manifest scope；连续增长只总结新增前缀，artifact count/latest index 动态刷新但不使摘要失效
+- 摘要失败、空白、缺结构标题或超过 16,000 chars / 约 4,096 tokens 不污染 source/state；`/clear`、项目/模型切换及新 SubAgent/Plan task 重置各自 projection state
+- Phase 90.3 已交付：`RequestContextEstimator` / `RequestContextBudget` 统一核算消息/图片、provider replay reasoning、tool-call 元数据、真实 tools wire schema、framing/envelope、response reserve 与 safety margin
+- soft trigger 改为 hard input ceiling 的 90%；ReAct、Plan task、Worker、Planner 与摘要/short-term compressor 均在 provider 前执行 hard gate，超限返回 `CONTEXT_VIEW_BUILD_FAILED` 且不提交候选 checkpoint
+- `/context`、底部 `ctx` 和 request log 共用 estimated input；默认 response reserve=8,192（clamp 25% window），safety=`max(2,048, 1% window)`（clamp 10% window），均允许配置为 0
+
+详细设计：`docs/phase-90-recoverable-context-compaction.md`
+
+---
+## 横向能力：OpenTelemetry / Langfuse 可观测性 ✅ ReAct MVP
+
+- OpenTelemetry SDK 可选初始化、OTLP/HTTP 自动配置、fat jar ServiceLoader 合并与退出 flush 已落地
+- ReAct 一轮对应一个根 observation，LLM 调用对应 generation，工具调用对应 tool
+- generation 记录模型与 token usage；并行工具显式传播父上下文；Runtime API 返回 trace/root observation ID
+- reasoning、图片 base64 与常见凭据不导出，属性做 16 KiB 上限
+- 10 条 Dataset 与 `tests_pass` / `task_success` / `token_count` Score 作为最小验收闭环
+
+**当前边界**：Plan / Team / 独立 SubAgent 埋点、线上采样与自动评测 runner 留待最小闭环通过后扩展。
+
+详细文档：`docs/langfuse-mvp-observability.md`
+
+---
+
+## 横向能力：评测体系 ✅ Phase E1–E4 / 🟡 Phase E5 第一批
+
+- `com.paicli.eval.EvalMain` 独立入口：黑盒驱动 `serve --http` 子进程，每 case 一次性工作区（fixture + JGit baseline）
+- Runtime API 提交任务并轮询终态；`command` / `output_assert` / `file_assert` / `tool_selection` / `safety` 五类门槛 grader，加上显式启用且非门禁的 `llm_judge`；`task_success` 至少需要一个 BOOLEAN 断言
+- 五个 suite：`custom` 10 条 + `tool-golden` 5 条 + `safety` 8 条 + `terminal` 5 条 + `swe-lite` 10 条；输出 `eval/runs/<run-id>/report.{json,md}` + 每 case artifact / diff / transcript / spans.jsonl
+- E2：`PAICLI_OTEL_TRACES_EXPORTER=file` 同步落盘 span；artifact 聚合 llm token 三段口径与 tool 明细，自动产出 `tokens_total` / `llm_rounds` / `tool_calls` / `tool_error_rate` 指标分
+- E3：`SandboxExecutor` host / docker 两档，按爆炸半径分级；`SafetyGrader` 用审计日志 + 工作区外 canary 哨兵双证据链判定 `guards_held` / `guard_block_rate`；`SecretRedactor` 工件脱敏；`RuntimeApiServer` 可配置监听地址（默认仍绑回环）
+- E4：新增 terminal 5 条与 swe-lite 10 条，支持全局 `--runs`、并发 run、固定 pass@1/pass@3 + coverage，以及 `--max-run-seconds` 总时限验收；2026-08-03 实跑 15 case × 3 runs，43/45 通过、pass@3=1.0000、耗时 688.758 秒
+- E5 第一批：固定 artifact/report `schema_version=1` 与 skip 工件契约；交付版本化 rubric、off/cache-only/live Judge、内容寻址缓存、校准计算器，以及可独立运行或挂到 `EvalMain --baseline` 的 `EvalCompare`
+
+**当前边界**：E3/E4 的 Docker 沙盒只服务评测 harness，不是产品运行时沙箱；E5 的 Langfuse 打通、Maven CI、线上 20 样本 Judge 校准、全量验收与 SOP 暂缓。
+
+详细文档：`docs/evaluation-system-design.md`
+
+---
+
 ## 技术栈演进图
 
 ```
@@ -651,4 +700,4 @@ Git       Prompt    异步后台    图片
 
 ---
 
-*已完成第 16 期 TUI 产品化（含 16.1 形态修正：默认切换为 inline 流式 TUI，Lanterna 全屏 TUI 通过 `PAICLI_RENDERER=lanterna` 保留）、第 17 期 LSP 诊断注入 MVP、第 18 期 Git Side-History 快照与回滚 MVP、第 19 期 Prompt 分层架构 MVP、第 20 期后台任务 + Runtime API MVP、第 21 期图片复制粘贴输入 MVP。*
+*已完成第 16 期 TUI 产品化（含 16.1 形态修正：默认切换为 inline 流式 TUI，Lanterna 全屏 TUI 通过 `PAICLI_RENDERER=lanterna` 保留）、第 17 期 LSP 诊断注入 MVP、第 18 期 Git Side-History 快照与回滚 MVP、第 19 期 Prompt 分层架构 MVP、第 20 期后台任务 + Runtime API MVP、第 21 期图片复制粘贴输入 MVP、Phase 90.1 可恢复工具结果工件、Phase 90.2 非破坏性历史投影、Phase 90.3 统一请求预算与 hard ceiling，以及 OpenTelemetry / Langfuse ReAct 可观测性 MVP。*
